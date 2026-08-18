@@ -1849,6 +1849,12 @@ def desired_spawn_order(
         )
         return (preferred, alternate)
 
+    # The first visible combat Unit is enough warning to establish a defense.
+    # Waiting for it to enter the immediate danger radius leaves a small
+    # economy too little time to accumulate the cheapest defender's price.
+    if hostile_units and combat_units == 0:
+        return (UnitType.VANGUARD, UnitType.RANGER)
+
     if workers < MIN_ECONOMY_WORKERS:
         return (UnitType.WORKER,)
 
@@ -1870,6 +1876,20 @@ def desired_spawn_order(
         )
         return (preferred, alternate)
     return ()
+
+
+def defender_reserve_cost(
+    turn,
+    enemies: tuple[CoreView | UnitView, ...],
+) -> int:
+    """Return the dynamic defender budget that nonessential upkeep must keep."""
+
+    if not combat_enemies(enemies):
+        return 0
+    return min(
+        unit_cost(UnitType.VANGUARD, turn.state.population),
+        unit_cost(UnitType.RANGER, turn.state.population),
+    )
 
 
 def economic_centroid(points: list[Position]) -> Position | None:
@@ -2074,15 +2094,6 @@ def plan_core(
         intents["core_healing"] += 1
         return
 
-    # HEAL resolves after combat and may be queued at full HP.  If known fire
-    # will pierce the shield without killing the Core, this restores the damage
-    # in the same Tick instead of spending the action on a post-combat spawn.
-    if 0 < incoming_hp_damage < core.hp and budget.resources > 0:
-        core.heal()
-        intents["core_healing"] += 1
-        intents["projected_damage"] += incoming_damage
-        return
-
     spawn_order = desired_spawn_order(turn, enemies)
     if danger:
         immediate_threats = core_threatening_enemies(core.position, enemies, obstacles)
@@ -2105,12 +2116,18 @@ def plan_core(
             UnitType.RANGER if preferred is UnitType.VANGUARD else UnitType.VANGUARD
         )
         spawn_order = (preferred, alternate)
+    defense_reserve = defender_reserve_cost(turn, enemies)
 
     def try_spawn() -> bool:
         if not spawn_order or not spawn_cell_open(turn):
             return False
         for unit_type in spawn_order:
             price = unit_cost(unit_type, population)
+            if (
+                unit_type is UnitType.WORKER
+                and budget.resources < price + defense_reserve
+            ):
+                continue
             first_defender_can_spend = (
                 unit_type is not UnitType.WORKER
                 and len(turn.vanguards) + len(turn.rangers) == 0
@@ -2123,10 +2140,16 @@ def plan_core(
                 and unit_type is not UnitType.WORKER
                 and budget.resources >= price
             )
+            reserved_defender_can_spend = (
+                defense_reserve > 0
+                and unit_type is not UnitType.WORKER
+                and budget.resources >= price
+            )
             if (
                 affordable(price, budget, capacity)
                 or first_defender_can_spend
                 or emergency_defender_can_spend
+                or reserved_defender_can_spend
             ):
                 core.spawn(unit_type)
                 budget.resources -= price
@@ -2137,20 +2160,39 @@ def plan_core(
     if danger and try_spawn():
         return
 
+    # HEAL resolves after combat and may be queued at full HP. Once a defender
+    # is affordable, producing it removes the damage source and outranks
+    # repeatedly buying back one HP. If the spawn cell is temporarily blocked,
+    # only the balance above the defender reserve may fund this recovery.
+    projected_heal_cost = CORE_HP_FLOOR - core.hp + incoming_hp_damage
+    if (
+        0 < incoming_hp_damage < core.hp
+        and budget.resources >= defense_reserve + projected_heal_cost
+    ):
+        core.heal()
+        intents["core_healing"] += 1
+        intents["projected_damage"] += incoming_damage
+        return
+
     if (
         danger
         and core.shield <= CORE_SHIELD_EMERGENCY_FLOOR
-        and budget.resources > 0
+        and budget.resources > defense_reserve
     ):
         core.repair_shield()
         intents["shield_repairing"] += 1
         return
 
-    if core.hp < CORE_HP_FLOOR and budget.resources > 0:
+    missing_core_hp = CORE_HP_FLOOR - core.hp
+    can_heal_without_spending_reserve = budget.resources > 0 and (
+        defense_reserve == 0
+        or budget.resources >= defense_reserve + missing_core_hp
+    )
+    if core.hp < CORE_HP_FLOOR and can_heal_without_spending_reserve:
         core.heal()
         intents["core_healing"] += 1
         return
-    if core.shield < CORE_SHIELD_FLOOR and budget.resources > 0:
+    if core.shield < CORE_SHIELD_FLOOR and budget.resources > defense_reserve:
         core.repair_shield()
         intents["shield_repairing"] += 1
         return
@@ -2165,7 +2207,7 @@ def plan_core(
     if (
         not spawn_order
         and core.shield < core_shield_target(turn)
-        and budget.resources > CORE_HEAL_RESERVE
+        and budget.resources > max(CORE_HEAL_RESERVE, defense_reserve)
     ):
         core.repair_shield()
         intents["shield_repairing"] += 1
@@ -2405,14 +2447,10 @@ def plan_worker(
 
 def unit_heal_reserve(turn, danger: bool) -> int:
     reserve = max(CORE_HEAL_RESERVE, CORE_HP_FLOOR - turn.core.hp)
-    if danger:
-        reserve = max(
-            reserve,
-            min(
-                unit_cost(UnitType.VANGUARD, turn.state.population),
-                unit_cost(UnitType.RANGER, turn.state.population),
-            ),
-        )
+    reserve = max(
+        reserve,
+        defender_reserve_cost(turn, turn.visible_enemies),
+    )
     return reserve
 
 

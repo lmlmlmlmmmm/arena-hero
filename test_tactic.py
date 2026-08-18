@@ -286,7 +286,7 @@ def test_core_repairs_shield():
     assert core_action_type(turn) == "RepairShieldAction"
 
 
-def test_projected_ranger_hp_damage_queues_post_combat_heal():
+def test_projected_ranger_hp_damage_preserves_defender_reserve():
     turn = make_turn(
         resources=5,
         objects=(
@@ -296,7 +296,21 @@ def test_projected_ranger_hp_damage_queues_post_combat_heal():
         ),
     )
     decide(turn)
-    assert core_action_type(turn) == "HealAction"
+    assert core_action_type(turn) == "WaitAction"
+
+
+def test_projected_ranger_hp_damage_spawns_affordable_defender_before_healing():
+    turn = make_turn(
+        resources=10,
+        objects=(
+            core_view(shield=0),
+            worker_view((4, 0), uid=2),
+            enemy_view((3, 0), unit_type=UnitType.RANGER),
+        ),
+    )
+    decide(turn)
+    assert core_action_type(turn) == "SpawnAction"
+    assert turn.plan.core_action.unit_type is UnitType.VANGUARD
 
 
 def test_danger_spawns_before_post_combat_emergency_shield_repair():
@@ -312,6 +326,159 @@ def test_danger_spawns_before_post_combat_emergency_shield_repair():
     decide(turn)
     assert core_action_type(turn) == "SpawnAction"
     assert turn.plan.core_action.unit_type is UnitType.RANGER
+
+
+def test_danger_saves_for_cheapest_defender_instead_of_repairing_shield():
+    turn = make_turn(
+        resources=8,
+        objects=(
+            core_view(shield=2),
+            worker_view((4, 0), uid=2),
+            enemy_view((2, 0)),
+        ),
+    )
+    decide(turn)
+    assert core_action_type(turn) == "WaitAction"
+
+
+def test_danger_spawns_defender_as_soon_as_reserve_reaches_its_price():
+    turn = make_turn(
+        resources=10,
+        objects=(
+            core_view(shield=2),
+            worker_view((4, 0), uid=2),
+            enemy_view((1, 0)),
+        ),
+    )
+    decide(turn)
+    assert core_action_type(turn) == "SpawnAction"
+    assert turn.plan.core_action.unit_type is UnitType.VANGUARD
+
+
+def test_visible_distant_hostile_starts_defender_reserve_before_danger():
+    turn = make_turn(
+        resources=8,
+        objects=(
+            core_view(shield=4),
+            worker_view((3, 0), uid=2),
+            enemy_view((5, 0)),
+        ),
+    )
+    decide(turn)
+    assert core_action_type(turn) == "WaitAction"
+
+
+def test_visible_distant_hostile_prioritizes_first_defender_over_worker():
+    workers = tuple(worker_view((10 + uid, 0), uid=uid) for uid in range(2, 8))
+    turn = make_turn(
+        resources=10,
+        objects=(
+            core_view(shield=4),
+            *workers,
+            enemy_view((5, 0)),
+        ),
+    )
+    decide(turn)
+    assert core_action_type(turn) == "SpawnAction"
+    assert turn.plan.core_action.unit_type is UnitType.VANGUARD
+
+
+def test_visible_distant_hostile_preserves_defender_budget_from_unit_healing():
+    turn = make_turn(
+        resources=10,
+        objects=(
+            core_view(),
+            worker_view((0, 0), hp=1, uid=2),
+            enemy_view((5, 0)),
+        ),
+    )
+    decide(turn)
+    assert action_type(turn.plan, 2) != "HealAction"
+    assert core_action_type(turn) == "SpawnAction"
+    assert turn.plan.core_action.unit_type is UnitType.VANGUARD
+
+
+def test_visible_distant_hostile_preserves_defender_budget_from_core_healing():
+    turn = make_turn(
+        resources=10,
+        objects=(
+            core_view(hp=4),
+            worker_view((3, 0), uid=2),
+            enemy_view((5, 0)),
+        ),
+    )
+    decide(turn)
+    assert core_action_type(turn) == "SpawnAction"
+    assert turn.plan.core_action.unit_type is UnitType.VANGUARD
+
+
+def test_critical_core_healing_can_spend_below_defender_reserve():
+    turn = make_turn(
+        resources=8,
+        objects=(
+            core_view(hp=2),
+            worker_view((4, 0), uid=2),
+            enemy_view((2, 0)),
+        ),
+    )
+    decide(turn)
+    assert core_action_type(turn) == "HealAction"
+
+
+def test_defender_reserve_uses_population_adjusted_price():
+    workers = tuple(
+        worker_view((10 + uid, 10), uid=uid) for uid in range(2, 22)
+    )
+    turn = make_turn(
+        resources=12,
+        objects=(core_view(shield=4), *workers, enemy_view((5, 0))),
+    )
+    decide(turn)
+    assert core_action_type(turn) == "WaitAction"
+
+
+def test_distant_hostile_keeps_reserve_when_a_guard_already_exists():
+    turn = make_turn(
+        resources=8,
+        objects=(
+            core_view(shield=4),
+            worker_view((3, 0), uid=2),
+            vanguard_view((2, 2), uid=4),
+            enemy_view((5, 0)),
+        ),
+    )
+    decide(turn)
+    assert core_action_type(turn) == "WaitAction"
+
+
+def test_worker_production_only_spends_above_visible_hostile_reserve():
+    objects = (
+        core_view(),
+        worker_view((3, 0), uid=2),
+        vanguard_view((2, 2), uid=4),
+        enemy_view((5, 0)),
+    )
+    saving_turn = make_turn(resources=14, objects=objects)
+    decide(saving_turn)
+    assert core_action_type(saving_turn) == "WaitAction"
+
+    surplus_turn = make_turn(resources=15, objects=objects)
+    decide(surplus_turn)
+    assert core_action_type(surplus_turn) == "SpawnAction"
+    assert surplus_turn.plan.core_action.unit_type is UnitType.WORKER
+
+
+def test_noncombat_enemies_do_not_trigger_defender_reserve():
+    for enemy in (
+        enemy_view((5, 0), unit_type=UnitType.WORKER),
+        enemy_view((5, 0), kind="CORE"),
+    ):
+        turn = make_turn(
+            resources=8,
+            objects=(core_view(shield=4), worker_view((3, 0), uid=2), enemy),
+        )
+        decide(turn)
+        assert core_action_type(turn) == "RepairShieldAction"
 
 
 def test_diagonal_ranger_fire_triggers_defender_production():
