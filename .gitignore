@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.log
+*.log.*
+scout_state.json
+scout_state.json.tmp
+supervisor.pid
+supervisor.stop
+supervisor.lock
+.env
+.claude/settings.local.json
