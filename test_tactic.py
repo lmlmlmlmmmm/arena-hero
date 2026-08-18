@@ -27,6 +27,7 @@ from tactic import (
     affordable,
     decide,
     is_legal_shot,
+    projected_post_combat_capacity,
     scout_target,
 )
 
@@ -424,6 +425,38 @@ def test_visible_distant_hostile_starts_defender_reserve_before_danger():
     assert core_action_type(turn) == "WaitAction"
 
 
+def test_recent_damage_keeps_defender_reserve_after_enemy_leaves_vision():
+    memory = ScoutMemory(core_threat_until_tick=105)
+    turn = make_turn(
+        tick=100,
+        resources=8,
+        objects=(
+            core_view(shield=4),
+            worker_view((5, 0), uid=2),
+        ),
+    )
+    decide(turn, memory)
+    assert core_action_type(turn) == "WaitAction"
+    assert memory.last_defense_status is not None
+    assert "reserve:10" in memory.last_defense_status
+    assert "spawn_blockers:funds=2" in memory.last_defense_status
+
+
+def test_recent_damage_spawns_defender_after_enemy_leaves_vision_when_funded():
+    memory = ScoutMemory(core_threat_until_tick=105)
+    turn = make_turn(
+        tick=100,
+        resources=10,
+        objects=(
+            core_view(shield=4),
+            worker_view((5, 0), uid=2),
+        ),
+    )
+    decide(turn, memory)
+    assert core_action_type(turn) == "SpawnAction"
+    assert turn.plan.core_action.unit_type is UnitType.VANGUARD
+
+
 def test_visible_distant_hostile_prioritizes_first_defender_over_worker():
     workers = tuple(worker_view((10 + uid, 0), uid=uid) for uid in range(2, 8))
     turn = make_turn(
@@ -570,6 +603,59 @@ def test_danger_spawns_defender():
     decide(turn)
     assert core_action_type(turn) == "SpawnAction"
     assert turn.plan.core_action.unit_type is UnitType.RANGER
+
+
+def test_projected_population_loss_uses_post_combat_capacity_for_defender():
+    turn = make_turn(
+        resources=12,
+        objects=(
+            core_view(),
+            vanguard_view((0, 1), hp=1, uid=4),
+            worker_view((5, 0), uid=2),
+            worker_view((5, 1), uid=3),
+            enemy_view((3, 0), uid=90, unit_type=UnitType.RANGER),
+            enemy_view((0, 2), uid=91, unit_type=UnitType.VANGUARD),
+        ),
+    )
+    decide(turn)
+    assert core_action_type(turn) == "SpawnAction"
+    assert turn.plan.core_action.unit_type is UnitType.VANGUARD
+
+
+def test_projected_capacity_includes_friendly_one_step_combat_exposure():
+    turn = make_turn(
+        objects=(
+            core_view(position=(10, 10)),
+            worker_view((2, 0), hp=1, uid=2),
+            worker_view((10, 11), uid=3),
+            worker_view((10, 12), uid=4),
+            enemy_view((0, 0), uid=90, unit_type=UnitType.VANGUARD),
+        ),
+    )
+    turn.unit(U(2)).move(Direction.LEFT)
+    assert projected_post_combat_capacity(
+        turn,
+        turn.visible_enemies,
+        turn.obstacle_cells,
+    ) == 10
+
+
+def test_planned_move_into_ranger_fire_reduces_core_spawn_budget():
+    turn = make_turn(
+        resources=12,
+        objects=(
+            core_view(),
+            vanguard_view((0, 2), hp=1, uid=4),
+            worker_view((10, 0), uid=2),
+            worker_view((10, 1), uid=3),
+            enemy_view((3, 0), uid=90, unit_type=UnitType.RANGER),
+        ),
+    )
+    decide(turn)
+    assert action_type(turn.plan, 4) == "MoveAction"
+    assert direction_of(turn.plan, 4) is Direction.RIGHT
+    assert core_action_type(turn) == "SpawnAction"
+    assert turn.plan.core_action.unit_type is UnitType.VANGUARD
 
 
 def test_respawning_waits():
@@ -1742,6 +1828,28 @@ def test_core_relocates_toward_multiple_active_resource_routes():
     decide(turn, memory)
     assert core_action_type(turn) == "StartMoveAction"
     assert turn.plan.core_action.direction is Direction.RIGHT
+
+
+def test_unit_healing_blocks_same_tick_core_migration():
+    memory = ScoutMemory(
+        known_resources={(20, 0), (20, 2)},
+        resource_last_seen={(20, 0): 100, (20, 2): 100},
+    )
+    turn = make_turn(
+        resources=5,
+        objects=(
+            core_view(),
+            worker_view((0, 0), hp=1, uid=2),
+            worker_view((10, 0), uid=3),
+            worker_view((11, 0), uid=4),
+            worker_view((12, 0), uid=5),
+            worker_view((13, 0), uid=6),
+        ),
+    )
+    decide(turn, memory)
+    assert action_type(turn.plan, 2) == "HealAction"
+    assert core_action_type(turn) == "WaitAction"
+    assert memory.last_migration_hold == "unit_healing"
 
 
 def test_empty_core_intercepts_nearest_cargo_instead_of_route_centroid():
@@ -3367,6 +3475,25 @@ def test_cargo_worker_evacuates_core_cell_for_emergency_spawn():
     assert action_type(turn.plan, 2) == "MoveAction"
     assert memory.last_intents["evacuating"] == 1
     assert core_action_type(turn) == "SpawnAction"
+
+
+def test_contestable_core_departure_does_not_enable_emergency_spawn():
+    turn = make_turn(
+        resources=12,
+        objects=(
+            core_view(position=(0, 0), shield=2),
+            worker_view((0, 0), cargo=1, uid=2),
+            enemy_view((2, 0), uid=90),
+            enemy_view((1, -1), uid=91, unit_type=UnitType.WORKER),
+        ),
+    )
+    memory = ScoutMemory()
+    decide(turn, memory)
+    assert action_type(turn.plan, 2) == "MoveAction"
+    assert direction_of(turn.plan, 2) is Direction.UP
+    assert core_action_type(turn) != "SpawnAction"
+    assert memory.last_defense_status is not None
+    assert "spawn_blockers:spawn_cell" in memory.last_defense_status
 
 
 def test_underfunded_core_accepts_cargo_then_clears_for_spawn_next_tick():

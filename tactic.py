@@ -34,6 +34,7 @@ from arena_hero import (
     Position,
     UnitType,
     UnitView,
+    core_resource_capacity,
     unit_cost,
 )
 
@@ -810,6 +811,73 @@ def projected_core_damage(
         elif is_legal_shot(enemy.position, core_position, obstacles):
             damage += 1
     return damage
+
+
+def projected_post_combat_capacity(
+    turn,
+    enemies: tuple[CoreView | UnitView, ...],
+    obstacles: frozenset[Position],
+) -> int:
+    """Return a conservative storage cap after visible combat losses.
+
+    Enemy actions are private, so exact casualties are unknowable. Treat every
+    currently killable friendly Unit as a possible loss. This can reserve more
+    cautiously than settlement, but it prevents deposits or Core actions from
+    relying on resources the server may destroy before healing and spawning.
+    """
+
+    hostile_units = combat_enemies(enemies)
+    possible_loss_costs: list[int] = []
+    for unit in turn.units:
+        # Movement resolves before combat. Include the current cell because a
+        # contested or blocked move may leave the Unit there, and include the
+        # planned destination when the plan already contains a MOVE. Before
+        # Unit planning this naturally evaluates only current positions.
+        possible_positions = {unit.position, projected_unit_position(unit, turn.plan)}
+        incoming = 0
+        for enemy in hostile_units:
+            if enemy.unit_type is UnitType.VANGUARD:
+                incoming += int(
+                    any(
+                        manhattan(enemy.position, position) == 1
+                        for position in possible_positions
+                    )
+                )
+            elif any(
+                is_legal_shot(enemy.position, position, obstacles)
+                for position in possible_positions
+            ):
+                incoming += 1
+        if incoming >= unit.hp:
+            possible_loss_costs.append(unit.hp)
+    # One Ranger can damage one object. A Vanguard sweep can damage every Unit
+    # in one adjacent cell; two is the normal capacity, while the occupancy
+    # count also covers any historical over-capacity state supplied by a Turn.
+    unit_occupancy = Counter(unit.position for unit in turn.units)
+    attack_budget = sum(
+        (
+            max(
+                2,
+                *(unit_occupancy[
+                    (
+                        enemy.position[0] + dx,
+                        enemy.position[1] + dy,
+                    )
+                ] for dx, dy in DIRECTION_DELTAS.values()),
+            )
+            if enemy.unit_type is UnitType.VANGUARD
+            else 1
+        )
+        for enemy in hostile_units
+    )
+    possible_losses = 0
+    for hp in sorted(possible_loss_costs):
+        if hp > attack_budget:
+            break
+        attack_budget -= hp
+        possible_losses += 1
+    population = max(0, turn.state.population - possible_losses)
+    return core_resource_capacity(population)
 
 
 def core_threatening_enemies(
@@ -1732,6 +1800,9 @@ def observe(turn, memory: ScoutMemory) -> Counter:
                 event.values,
             )
         elif event.event_type == "CORE_RESPAWNED":
+            if memory.core_threat_until_tick:
+                memory.core_threat_until_tick = 0
+                memory.dirty = True
             log.warning(
                 "tick=%d core respawned position=%s values=%s",
                 turn.tick,
@@ -1856,21 +1927,68 @@ def projected_unit_position(unit, plan) -> Position:
     return (unit.position[0] + dx, unit.position[1] + dy)
 
 
+def planned_core_departure_is_reliable(turn, unit) -> bool:
+    """Return whether a planned move off the Core has no visible failure path."""
+
+    action = turn.plan.unit_actions.get(unit.id)
+    if not isinstance(action, MoveAction):
+        return False
+    destination = projected_unit_position(unit, turn.plan)
+    if destination in turn.obstacle_cells:
+        return False
+
+    # Count current occupants even when they plan to leave: if their departure
+    # fails, this move must still fit. Count all other planned arrivals too.
+    current_occupants = sum(
+        other.id != unit.id and other.position == destination for other in turn.units
+    )
+    if turn.core is not None and turn.core.position == destination:
+        current_occupants += 1
+    planned_arrivals = sum(
+        other.id != unit.id
+        and other.position != destination
+        and projected_unit_position(other, turn.plan) == destination
+        for other in turn.units
+    )
+    if current_occupants + planned_arrivals + 1 > 2:
+        return False
+
+    for enemy in turn.visible_enemies:
+        if enemy.position == destination:
+            return False
+        if isinstance(enemy, UnitView) and manhattan(enemy.position, destination) == 1:
+            return False
+        if (
+            isinstance(enemy, CoreView)
+            and enemy.state is CoreState.MOVING
+            and enemy.destination == destination
+            and (enemy.move_progress or 0) + 1 >= (enemy.move_required_ticks or 4)
+        ):
+            return False
+    return True
+
+
 def spawn_cell_open(turn) -> bool:
-    """Return whether planned Unit movement leaves the Core cell available."""
+    """Return whether the Core cell will reliably have one free spawn slot."""
 
     if turn.core is None or not core_is_stationary(turn):
         return False
     core_position = turn.core.position
-    return not any(
-        projected_unit_position(unit, turn.plan) == core_position
-        for unit in turn.units
-    )
+    for unit in turn.units:
+        if projected_unit_position(unit, turn.plan) == core_position:
+            return False
+        if unit.position == core_position and not planned_core_departure_is_reliable(
+            turn,
+            unit,
+        ):
+            return False
+    return True
 
 
 def desired_spawn_order(
     turn,
     enemies: tuple[CoreView | UnitView, ...],
+    defense_caution: bool = False,
 ) -> tuple[UnitType, ...]:
     """Return a staged, adaptive production preference for this Turn."""
 
@@ -1893,7 +2011,7 @@ def desired_spawn_order(
     # The first visible combat Unit is enough warning to establish a defense.
     # Waiting for it to enter the immediate danger radius leaves a small
     # economy too little time to accumulate the cheapest defender's price.
-    if hostile_units and combat_units == 0:
+    if (hostile_units or defense_caution) and combat_units == 0:
         return (UnitType.VANGUARD, UnitType.RANGER)
 
     if workers < MIN_ECONOMY_WORKERS:
@@ -1922,10 +2040,12 @@ def desired_spawn_order(
 def defender_reserve_cost(
     turn,
     enemies: tuple[CoreView | UnitView, ...],
+    *,
+    defense_caution: bool = False,
 ) -> int:
     """Return the dynamic defender budget that nonessential upkeep must keep."""
 
-    if not combat_enemies(enemies):
+    if not combat_enemies(enemies) and not defense_caution:
         return 0
     return min(
         unit_cost(UnitType.VANGUARD, turn.state.population),
@@ -1947,10 +2067,15 @@ def summarize_defense_decision(
     turn,
     enemies: tuple[CoreView | UnitView, ...],
     core_budget: int,
+    defense_caution: bool = False,
 ) -> str | None:
     """Describe the active defender reserve and the Core decision it produced."""
 
-    reserve = defender_reserve_cost(turn, enemies)
+    reserve = defender_reserve_cost(
+        turn,
+        enemies,
+        defense_caution=defense_caution,
+    )
     if reserve == 0 or turn.core is None:
         return None
     target, price = defender_reserve_target(turn)
@@ -2138,6 +2263,8 @@ def plan_core(
     defense_caution: bool,
     memory: ScoutMemory,
     intents: Counter,
+    settled_capacity: int | None = None,
+    healed_units: set[UUID] | None = None,
 ) -> None:
     core = turn.core
     if core is None:
@@ -2172,7 +2299,10 @@ def plan_core(
         return
 
     population = turn.state.population
-    capacity = turn.resource_capacity
+    capacity = min(
+        turn.resource_capacity,
+        settled_capacity if settled_capacity is not None else turn.resource_capacity,
+    )
     danger = core_in_danger(
         core.position,
         enemies,
@@ -2187,7 +2317,7 @@ def plan_core(
         intents["core_healing"] += 1
         return
 
-    spawn_order = desired_spawn_order(turn, enemies)
+    spawn_order = desired_spawn_order(turn, enemies, defense_caution)
     if danger:
         immediate_threats = core_threatening_enemies(core.position, enemies, obstacles)
         adjacent_vanguard = any(
@@ -2209,7 +2339,11 @@ def plan_core(
             UnitType.RANGER if preferred is UnitType.VANGUARD else UnitType.VANGUARD
         )
         spawn_order = (preferred, alternate)
-    defense_reserve = defender_reserve_cost(turn, enemies)
+    defense_reserve = defender_reserve_cost(
+        turn,
+        enemies,
+        defense_caution=defense_caution,
+    )
 
     def try_spawn() -> bool:
         if not spawn_order or not spawn_cell_open(turn):
@@ -2304,6 +2438,10 @@ def plan_core(
     ):
         core.repair_shield()
         intents["shield_repairing"] += 1
+        return
+    if healed_units:
+        memory.last_migration_hold = "unit_healing"
+        core.wait()
         return
     if start_economic_core_move(
         turn,
@@ -2550,22 +2688,36 @@ def plan_worker(
     worker.wait()
 
 
-def unit_heal_reserve(turn, danger: bool) -> int:
+def unit_heal_reserve(
+    turn,
+    danger: bool,
+    defense_caution: bool = False,
+) -> int:
     reserve = max(CORE_HEAL_RESERVE, CORE_HP_FLOOR - turn.core.hp)
     reserve = max(
         reserve,
-        defender_reserve_cost(turn, turn.visible_enemies),
+        defender_reserve_cost(
+            turn,
+            turn.visible_enemies,
+            defense_caution=danger or defense_caution,
+        ),
     )
     return reserve
 
 
-def plan_unit_heals(turn, budget: TickBudget, danger: bool, intents: Counter) -> set[UUID]:
+def plan_unit_heals(
+    turn,
+    budget: TickBudget,
+    danger: bool,
+    intents: Counter,
+    defense_caution: bool = False,
+) -> set[UUID]:
     """Queue affordable post-combat heals after projected deposits are known."""
 
     healed: set[UUID] = set()
     if not core_is_stationary(turn):
         return healed
-    reserve = unit_heal_reserve(turn, danger)
+    reserve = unit_heal_reserve(turn, danger, defense_caution)
     for unit in sorted(turn.units, key=lambda candidate: str(candidate.id)):
         if unit.id in turn.plan.unit_actions:
             continue
@@ -2855,8 +3007,27 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
     worker_travel_blocked = worker_blocked | ({core_position} if danger else set())
     worker_hard_blocked = blocked | ({core_position} if danger else set())
 
-    budget = TickBudget(resources=turn.resources, space=turn.resource_space)
-    defense_reserve = defender_reserve_cost(turn, enemies)
+    settled_capacity = projected_post_combat_capacity(turn, enemies, obstacles)
+    capacity_at_risk = settled_capacity < turn.resource_capacity
+    settled_resources = (
+        min(turn.resources, settled_capacity) if capacity_at_risk else turn.resources
+    )
+    budget = TickBudget(
+        resources=settled_resources,
+        space=(
+            min(
+                turn.resource_space,
+                max(0, settled_capacity - settled_resources),
+            )
+            if capacity_at_risk
+            else turn.resource_space
+        ),
+    )
+    defense_reserve = defender_reserve_cost(
+        turn,
+        enemies,
+        defense_caution=defense_caution,
+    )
     reservations = MovementReservations(destinations=set(memory.contested))
     if memory.contested:
         log.info("tick=%d backoff contested=%s", turn.tick, sorted(memory.contested))
@@ -2951,7 +3122,13 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
 
     # Deposits resolve before healing and the Core action. Planning them first
     # makes their same-Tick budget available without assuming a move can deposit.
-    healed = plan_unit_heals(turn, budget, danger, intents)
+    healed = plan_unit_heals(
+        turn,
+        budget,
+        danger,
+        intents,
+        defense_caution,
+    )
 
     danger_guard_id = (
         choose_danger_worker_guard(
@@ -3240,6 +3417,24 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
             guard_core=worker.id == danger_guard_id,
         )
 
+    # Unit movement is now fully planned, so rerun the capacity preview against
+    # the actual destinations before choosing the Core action. Deposits happen
+    # before combat and Unit heals happen after it; model that order when
+    # rebuilding the remaining Core budget after a newly exposed casualty.
+    settled_capacity = projected_post_combat_capacity(turn, enemies, obstacles)
+    if settled_capacity < turn.resource_capacity:
+        planned_unit_heal_cost = sum(
+            max_hp(unit) - 1
+            for unit in turn.units
+            if unit.id in healed
+        )
+        pre_heal_resources = min(
+            turn.resources + budget.projected_deposits,
+            settled_capacity,
+        )
+        budget.resources = max(0, pre_heal_resources - planned_unit_heal_cost)
+        budget.space = max(0, settled_capacity - pre_heal_resources)
+
     activity_points: list[Position] = []
     for worker in cargo_workers:
         activity_points.extend((worker.position, worker.position))
@@ -3263,11 +3458,14 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
         defense_caution,
         memory,
         intents,
+        settled_capacity,
+        healed,
     )
     memory.last_defense_status = summarize_defense_decision(
         turn,
         enemies,
         core_budget,
+        defense_caution,
     )
 
     if reservations.by_unit:
