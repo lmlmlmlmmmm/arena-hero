@@ -101,6 +101,9 @@ SCOUT_COVERAGE_TTL = 4096
 SCOUT_COVERAGE_MAX_CELLS = 32768
 SCOUT_HISTORY_LIMIT = 8
 SCOUT_LOOP_WINDOW = 6
+# A Worker standing perfectly still appends nothing to its position history, so
+# oscillation detection alone cannot see it.  Count the idle Ticks separately.
+WORKER_STALL_TICKS = 6
 SCOUT_ABSOLUTE_GRID_SCHEMA = 3
 SCOUT_STATE_SCHEMA = 5
 SCOUT_SAVE_INTERVAL = 8
@@ -191,6 +194,7 @@ class ScoutMemory:
     scout_seen: dict[tuple[int, int], int] = field(default_factory=dict)
     scout_targets: dict[str, tuple[int, int]] = field(default_factory=dict)
     scout_positions: dict[str, list[Position]] = field(default_factory=dict)
+    position_stalls: dict[str, int] = field(default_factory=dict)
     resource_assignments: dict[str, Position] = field(default_factory=dict)
     resource_progress: dict[str, ResourceProgress] = field(default_factory=dict)
     resource_cooldowns: dict[tuple[str, Position], int] = field(default_factory=dict)
@@ -363,6 +367,7 @@ class ScoutMemory:
             self.scout_seen = {}
             self.scout_targets = {}
             self.scout_positions = {}
+            self.position_stalls = {}
             self.dirty = True
             log.info(
                 "migrating legacy scout state at %s; retained obstacles=%d resources=%d",
@@ -375,6 +380,12 @@ class ScoutMemory:
             self.sweeps = parse_int_map(raw.get("sweeps", {}))
             self.scout_seen = parse_cell_int_map(raw.get("scout_seen", {}))
             self.scout_targets = parse_position_map(raw.get("scout_targets", {}))
+            self.position_stalls = {
+                worker_id: max(0, count)
+                for worker_id, count in parse_int_map(
+                    raw.get("position_stalls", {})
+                ).items()
+            }
             self.scout_positions = {}
             raw_positions = raw.get("scout_positions", {})
             if isinstance(raw_positions, dict):
@@ -433,6 +444,7 @@ class ScoutMemory:
                             worker_id: [list(position) for position in positions]
                             for worker_id, positions in self.scout_positions.items()
                         },
+                        "position_stalls": self.position_stalls,
                         "resource_assignments": {
                             worker_id: list(target)
                             for worker_id, target in self.resource_assignments.items()
@@ -530,6 +542,7 @@ class ScoutMemory:
             self.sweeps,
             self.scout_targets,
             self.scout_positions,
+            self.position_stalls,
             self.resource_assignments,
             self.resource_progress,
             self.last_move_destinations,
@@ -618,12 +631,21 @@ class ScoutMemory:
 
     def record_position(self, worker_id: str, position: Position) -> None:
         history = self.scout_positions.setdefault(worker_id, [])
-        if not history or history[-1] != position:
-            history.append(position)
-            del history[:-SCOUT_HISTORY_LIMIT]
+        if history and history[-1] == position:
+            # Holding one cell adds no history, which used to make a frozen
+            # Worker indistinguishable from one halfway along a healthy route.
+            # Count the idle Ticks so is_looping can see a standstill.
+            self.position_stalls[worker_id] = self.position_stalls.get(worker_id, 0) + 1
             self.dirty = True
+            return
+        history.append(position)
+        del history[:-SCOUT_HISTORY_LIMIT]
+        self.position_stalls.pop(worker_id, None)
+        self.dirty = True
 
     def is_looping(self, worker_id: str) -> bool:
+        if self.position_stalls.get(worker_id, 0) >= WORKER_STALL_TICKS:
+            return True
         history = self.scout_positions.get(worker_id, [])
         if len(history) < SCOUT_LOOP_WINDOW:
             return False
@@ -2339,6 +2361,25 @@ def plan_worker(
             continue
         advance_scout(worker_id, memory)
         target = scout_target(worker_id, core_position, memory)
+
+    # Every waypoint this Tick was unreachable.  The cursor churn above is
+    # deliberate — eight steps walk one whole ray, so the next Tick starts on a
+    # different ray — but rotating rays cannot help a Worker that is boxed in,
+    # and it used to end here in a bare wait() that repeated forever.
+    if memory.is_looping(worker_id):
+        # Same precedent as a stuck carrier: a Worker that has held one cell for
+        # WORKER_STALL_TICKS stops respecting threat arcs rather than idling
+        # forever.  One point of damage costs less than a scout that never scouts.
+        escape = hard_blocked if hard_blocked is not None else blocked
+        if move_or_escape(worker, core_position, escape, escape, reservations):
+            log.info(
+                "tick=%d worker %s unsticking after %d idle Ticks at %s",
+                turn.tick,
+                worker_id[:8],
+                memory.position_stalls.get(worker_id, 0),
+                position,
+            )
+            return
     worker.wait()
 
 
@@ -2937,6 +2978,7 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
                 worker_blocked,
                 scout_radius,
             ),
+            hard_blocked=blocked,
         )
 
     activity_points: list[Position] = []

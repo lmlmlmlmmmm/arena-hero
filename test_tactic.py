@@ -2760,3 +2760,115 @@ def test_corrupt_cooldown_and_progress_entries_are_skipped(tmp_path):
     assert memory.depleted == {(2, 0): 140}
     assert memory.contested == {(1, 0): 104}
     assert set(memory.resource_progress) == {"keep"}
+
+
+# --- loitering: a Worker frozen on one cell must become visible and unstick ---
+
+
+def test_standing_still_is_counted_as_a_stall():
+    from tactic import WORKER_STALL_TICKS
+
+    memory = ScoutMemory()
+    worker_id = str(U(2))
+    # A real route first, so the oscillation window looks perfectly healthy.
+    for cell in ((0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0)):
+        memory.record_position(worker_id, cell)
+    assert memory.is_looping(worker_id) is False
+    for _ in range(WORKER_STALL_TICKS - 1):
+        memory.record_position(worker_id, (6, 0))
+    assert memory.is_looping(worker_id) is False
+    memory.record_position(worker_id, (6, 0))
+    assert memory.is_looping(worker_id) is True
+
+
+def test_moving_again_clears_the_stall():
+    from tactic import WORKER_STALL_TICKS
+
+    memory = ScoutMemory()
+    worker_id = str(U(2))
+    memory.record_position(worker_id, (6, 0))
+    for _ in range(WORKER_STALL_TICKS + 4):
+        memory.record_position(worker_id, (6, 0))
+    assert memory.is_looping(worker_id) is True
+    memory.record_position(worker_id, (7, 0))
+    assert memory.position_stalls.get(worker_id, 0) == 0
+    assert memory.is_looping(worker_id) is False
+
+
+def test_dead_workers_do_not_keep_a_stall_counter():
+    memory = ScoutMemory()
+    memory.record_position(str(U(2)), (6, 0))
+    memory.record_position(str(U(2)), (6, 0))
+    memory.record_position(str(U(3)), (1, 1))
+    memory.record_position(str(U(3)), (1, 1))
+    memory.prune_workers({str(U(3))})
+    assert set(memory.position_stalls) == {str(U(3))}
+
+
+def test_stall_counters_survive_a_restart(tmp_path):
+    path = tmp_path / "scout_state.json"
+    saved = ScoutMemory(
+        scout_positions={str(U(2)): [(6, 0)]},
+        position_stalls={str(U(2)): 5},
+        path=path,
+        dirty=True,
+    )
+    saved.save()
+    restored = ScoutMemory(path=path)
+    restored.load()
+    # A restart used to reset the counter, so a Worker that had already idled for
+    # minutes got a fresh clean slate and kept idling.
+    assert restored.position_stalls == {str(U(2)): 5}
+
+
+def _boxed_scout(stalls: int):
+    """A scout whose every route is soft-blocked, with open terrain underneath."""
+
+    from tactic import MovementReservations, TickBudget, plan_worker
+
+    turn = make_turn(
+        resources=0,
+        objects=(core_view(position=(0, 0)), worker_view((10, 10), uid=2)),
+    )
+    worker = turn.workers[0]
+    # Set the history directly: record_position() clears the counter whenever it
+    # appends a new cell, which would undo the standstill this test is about.
+    memory = ScoutMemory(
+        scout_positions={str(worker.id): [(10, 10)]},
+        position_stalls={str(worker.id): stalls},
+    )
+    soft = {(9, 10), (11, 10), (10, 9), (10, 11)}
+    plan_worker(
+        worker,
+        turn,
+        (0, 0),
+        (0, 0),
+        True,
+        soft,
+        MovementReservations(),
+        None,
+        frozenset(),
+        False,
+        TickBudget(resources=0, space=10),
+        memory,
+        None,
+        hard_blocked=set(),
+    )
+    return turn
+
+
+def test_idle_scout_unsticks_by_dropping_threat_arcs():
+    from tactic import WORKER_STALL_TICKS
+
+    turn = _boxed_scout(WORKER_STALL_TICKS)
+    # Before the fix this Worker queued Wait every Tick forever: threat arcs
+    # sealed every route and nothing ever noticed it had stopped moving.
+    assert action_type(turn.plan, 2) == "MoveAction"
+    assert direction_of(turn.plan, 2) in (Direction.LEFT, Direction.UP)
+
+
+def test_scout_that_has_not_idled_long_enough_still_respects_threat_arcs():
+    from tactic import WORKER_STALL_TICKS
+
+    turn = _boxed_scout(WORKER_STALL_TICKS - 2)
+    assert action_type(turn.plan, 2) == "WaitAction"
