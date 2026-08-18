@@ -2318,12 +2318,13 @@ def plan_worker(
             log.info("tick=%d forgetting visible stale resource=%s", turn.tick, position)
             resource_target = None
 
-    if retreat and position != core_position:
-        # Walk all the way onto the Core cell rather than stopping alongside it:
-        # plan_unit_heals only ever heals a Unit standing exactly there, which is
-        # why a damaged Worker could never be repaired.  Prefer the safe route
-        # and fall back to hard terrain only when a threat arc would otherwise
-        # pin the Worker in place next to whatever is shooting at it.
+    retreat_stop = 1 if danger else 0
+    if retreat and manhattan(position, core_position) > retreat_stop:
+        # Reaching the Core cell is what lets plan_unit_heals repair this Worker;
+        # stopping alongside it is why a damaged Worker was never healed.  Under
+        # threat, retreat_stop keeps that cell clear instead: a Unit projected
+        # onto it makes spawn_cell_open() false and would block the emergency
+        # defender, and plan_unit_heals skips Workers during danger anyway.
         move_or_escape(
             worker,
             core_position,

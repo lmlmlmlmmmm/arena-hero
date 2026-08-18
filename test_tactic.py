@@ -2982,3 +2982,19 @@ def test_retreating_worker_still_prefers_a_safe_route():
     decide(turn, ScoutMemory())
     assert action_type(turn.plan, 2) == "MoveAction"
     assert direction_of(turn.plan, 2) is not Direction.LEFT
+
+
+def test_retreating_worker_does_not_block_the_emergency_defender():
+    # The Core needs the spawn cell far more than a two hit point Worker needs
+    # cover: spawn_cell_open() is false while any Unit is projected onto it.
+    turn = make_turn(
+        resources=12,
+        objects=(
+            core_view(position=(0, 0)),
+            worker_view((1, 0), cargo=0, hp=2, uid=2),
+            enemy_view((2, 0), uid=90),
+        ),
+    )
+    decide(turn, ScoutMemory())
+    assert core_action_type(turn) == "SpawnAction"
+    assert turn.plan.core_action.unit_type is not UnitType.WORKER
