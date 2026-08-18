@@ -151,6 +151,9 @@ CORE_DEFENSE_ALERT_DISTANCE = 8
 CORE_SHIELD_EMERGENCY_FLOOR = 2
 CORE_THREAT_CAUTION_TICKS = 6
 CORE_PREFERRED_RESOURCE_QUOTA = 6
+# A Worker has two hit points and sees three cells, so it can neither win nor
+# outrun a fight it has already walked into.  Leave before contact, not after.
+WORKER_FLEE_DISTANCE = 4
 
 GUARD_OFFSETS = (
     (0, -2),
@@ -2275,6 +2278,7 @@ def plan_worker(
     memory: ScoutMemory,
     scout_goal: Position | None = None,
     hard_blocked: set[Position] | None = None,
+    retreat: bool = False,
 ) -> None:
     position = worker.position
     worker_id = str(worker.id)
@@ -2313,6 +2317,21 @@ def plan_worker(
             memory.forget_resource(position)
             log.info("tick=%d forgetting visible stale resource=%s", turn.tick, position)
             resource_target = None
+
+    if retreat and position != core_position:
+        # Walk all the way onto the Core cell rather than stopping alongside it:
+        # plan_unit_heals only ever heals a Unit standing exactly there, which is
+        # why a damaged Worker could never be repaired.  Prefer the safe route
+        # and fall back to hard terrain only when a threat arc would otherwise
+        # pin the Worker in place next to whatever is shooting at it.
+        move_or_escape(
+            worker,
+            core_position,
+            blocked,
+            hard_blocked if hard_blocked is not None else blocked,
+            reservations,
+        )
+        return
 
     if danger and manhattan(position, core_position) > 1:
         move_or_wait(worker, core_position, blocked, reservations)
@@ -2587,6 +2606,23 @@ def max_hp(unit) -> int:
     return 2
 
 
+def worker_should_retreat(worker, hostile_units) -> bool:
+    """Decide whether this Worker should be walking home instead of working.
+
+    Damage used to change a Worker's behaviour in no way at all: a Worker on its
+    last hit point kept scouting exactly as if it were fresh, and because it
+    never came home the heal path — which only fires on the Core cell — had
+    never once run.  Replacing a Worker costs five; healing one costs one.
+    """
+
+    if worker.hp < max_hp(worker):
+        return True
+    return any(
+        manhattan(worker.position, enemy.position) <= WORKER_FLEE_DISTANCE
+        for enemy in hostile_units
+    )
+
+
 def decide(turn, memory: ScoutMemory | None = None) -> None:
     """Queue one complete plan for the Turn using the balanced policy."""
 
@@ -2711,6 +2747,7 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
             budget,
             memory,
             hard_blocked=blocked,
+            retreat=worker_should_retreat(worker, hostile_units),
         )
 
     # Deposits resolve before healing and the Core action. Planning them first
@@ -2868,6 +2905,8 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
             danger,
             budget,
             memory,
+            hard_blocked=blocked,
+            retreat=worker_should_retreat(worker, hostile_units),
         )
 
     combat_units = sorted(
@@ -2979,6 +3018,7 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
                 scout_radius,
             ),
             hard_blocked=blocked,
+            retreat=worker_should_retreat(worker, hostile_units),
         )
 
     activity_points: list[Position] = []

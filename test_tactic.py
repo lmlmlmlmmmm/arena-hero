@@ -2872,3 +2872,113 @@ def test_scout_that_has_not_idled_long_enough_still_respects_threat_arcs():
 
     turn = _boxed_scout(WORKER_STALL_TICKS - 2)
     assert action_type(turn.plan, 2) == "WaitAction"
+
+
+# --- unit preservation: hurt or cornered Workers walk home ------------------
+
+
+def test_healthy_worker_walks_to_its_node():
+    turn = make_turn(
+        resources=5,
+        objects=(
+            core_view(position=(0, 0)),
+            worker_view((10, 0), cargo=0, hp=2, uid=2),
+            terrain("RESOURCE", [(12, 0)]),
+        ),
+    )
+    decide(turn, ScoutMemory())
+    assert direction_of(turn.plan, 2) is Direction.RIGHT
+
+
+def test_damaged_worker_abandons_the_node_and_walks_home():
+    turn = make_turn(
+        resources=5,
+        objects=(
+            core_view(position=(0, 0)),
+            worker_view((10, 0), cargo=0, hp=1, uid=2),
+            terrain("RESOURCE", [(12, 0)]),
+        ),
+    )
+    decide(turn, ScoutMemory())
+    # Damage used to change nothing at all: this Worker kept walking outward on
+    # its last hit point and could never reach the only cell that heals it.
+    assert direction_of(turn.plan, 2) is Direction.LEFT
+
+
+def test_worker_retreats_from_a_nearby_enemy():
+    from tactic import WORKER_FLEE_DISTANCE
+
+    turn = make_turn(
+        resources=5,
+        objects=(
+            core_view(position=(0, 0)),
+            worker_view((10, 0), cargo=0, hp=2, uid=2),
+            terrain("RESOURCE", [(12, 0)]),
+            enemy_view((10, WORKER_FLEE_DISTANCE), uid=90),
+        ),
+    )
+    decide(turn, ScoutMemory())
+    # The Core is twelve cells away, so core-level danger never fired and this
+    # Worker used to walk on toward the node with an enemy on top of it.
+    assert direction_of(turn.plan, 2) is Direction.LEFT
+
+
+def test_worker_ignores_an_enemy_that_is_far_away():
+    from tactic import WORKER_FLEE_DISTANCE
+
+    turn = make_turn(
+        resources=5,
+        objects=(
+            core_view(position=(0, 0)),
+            worker_view((10, 0), cargo=0, hp=2, uid=2),
+            terrain("RESOURCE", [(12, 0)]),
+            enemy_view((10, WORKER_FLEE_DISTANCE + 6), uid=90),
+        ),
+    )
+    decide(turn, ScoutMemory())
+    assert direction_of(turn.plan, 2) is Direction.RIGHT
+
+
+def test_damaged_worker_on_the_core_cell_is_finally_healed():
+    turn = make_turn(
+        resources=5,
+        objects=(
+            core_view(position=(0, 0)),
+            worker_view((0, 0), cargo=0, hp=1, uid=2),
+        ),
+    )
+    memory = ScoutMemory()
+    decide(turn, memory)
+    # The heal path had never once fired in production: nothing sent a damaged
+    # Worker to the one cell where healing is allowed.
+    assert action_type(turn.plan, 2) == "HealAction"
+    assert memory.last_intents["healing"] == 1
+
+
+def test_healing_is_skipped_when_the_core_cannot_afford_it():
+    turn = make_turn(
+        resources=2,
+        objects=(
+            core_view(position=(0, 0)),
+            worker_view((0, 0), cargo=0, hp=1, uid=2),
+        ),
+    )
+    decide(turn, ScoutMemory())
+    assert action_type(turn.plan, 2) != "HealAction"
+
+
+def test_retreating_worker_still_prefers_a_safe_route():
+    # A Vanguard threatens only its four neighbours, so parking it at (8, 0)
+    # poisons exactly the next step of the direct route home. Fleeing must mean
+    # detouring around the firing line, not walking through it.
+    turn = make_turn(
+        resources=5,
+        objects=(
+            core_view(position=(0, 0)),
+            worker_view((10, 0), cargo=0, hp=1, uid=2),
+            enemy_view((8, 0), uid=90),
+        ),
+    )
+    decide(turn, ScoutMemory())
+    assert action_type(turn.plan, 2) == "MoveAction"
+    assert direction_of(turn.plan, 2) is not Direction.LEFT
