@@ -355,6 +355,62 @@ def test_danger_spawns_defender_as_soon_as_reserve_reaches_its_price():
     assert turn.plan.core_action.unit_type is UnitType.VANGUARD
 
 
+def test_defense_telemetry_reports_the_reserved_defender_shortfall():
+    memory = ScoutMemory()
+    turn = make_turn(
+        resources=8,
+        objects=(
+            core_view(shield=2),
+            worker_view((4, 0), uid=2),
+            enemy_view((2, 0)),
+        ),
+    )
+    decide(turn, memory)
+    assert memory.last_defense_status is not None
+    assert "reserve:10" in memory.last_defense_status
+    assert "reserve_target:VANGUARD@10" in memory.last_defense_status
+    assert "spawn_blockers:funds=2" in memory.last_defense_status
+    assert "decision:wait" in memory.last_defense_status
+
+
+def test_defense_telemetry_reports_a_blocked_spawn_cell():
+    memory = ScoutMemory()
+    turn = make_turn(
+        resources=10,
+        objects=(
+            core_view(shield=2),
+            worker_view((0, 0), cargo=1, uid=2),
+            enemy_view((2, 0)),
+            terrain("OBSTACLE", [(-1, 0), (0, -1), (0, 1)]),
+        ),
+    )
+    decide(turn, memory)
+    assert memory.last_defense_status is not None
+    assert "cell:blocked" in memory.last_defense_status
+    assert "spawn_blockers:spawn_cell" in memory.last_defense_status
+    assert "decision:wait" in memory.last_defense_status
+
+
+def test_defense_telemetry_separates_spawn_blocker_from_surplus_repair():
+    memory = ScoutMemory()
+    turn = make_turn(
+        resources=14,
+        objects=(
+            core_view(shield=2),
+            vanguard_view((0, 0), hp=1, uid=4),
+            worker_view((5, 0), uid=2),
+            worker_view((5, 1), uid=3),
+            enemy_view((2, 0)),
+        ),
+    )
+    decide(turn, memory)
+    assert action_type(turn.plan, 4) == "HealAction"
+    assert core_action_type(turn) == "RepairShieldAction"
+    assert memory.last_defense_status is not None
+    assert "spawn_blockers:spawn_cell" in memory.last_defense_status
+    assert "decision:repair_shield" in memory.last_defense_status
+
+
 def test_visible_distant_hostile_starts_defender_reserve_before_danger():
     turn = make_turn(
         resources=8,
@@ -413,6 +469,7 @@ def test_visible_distant_hostile_preserves_defender_budget_from_core_healing():
 
 
 def test_critical_core_healing_can_spend_below_defender_reserve():
+    memory = ScoutMemory()
     turn = make_turn(
         resources=8,
         objects=(
@@ -421,8 +478,10 @@ def test_critical_core_healing_can_spend_below_defender_reserve():
             enemy_view((2, 0)),
         ),
     )
-    decide(turn)
+    decide(turn, memory)
     assert core_action_type(turn) == "HealAction"
+    assert memory.last_defense_status is not None
+    assert "decision:heal:critical" in memory.last_defense_status
 
 
 def test_defender_reserve_uses_population_adjusted_price():
@@ -2129,6 +2188,21 @@ def test_intent_metrics_cover_worker_and_guard_roles():
     assert memory.last_intents["guarding"] == 1
 
 
+def test_fleet_summary_reports_each_unit_type():
+    from tactic import summarize_fleet
+
+    turn = make_turn(
+        objects=(
+            core_view(),
+            worker_view((1, 0), uid=2),
+            worker_view((2, 0), uid=3),
+            vanguard_view((3, 0), uid=4),
+            ranger_view((4, 0), uid=5),
+        ),
+    )
+    assert summarize_fleet(turn) == "fleet[w:2,v:1,r:1]"
+
+
 def test_lone_guard_holds_when_only_enemy_is_far_from_core():
     memory = ScoutMemory()
     turn = make_turn(
@@ -2407,6 +2481,100 @@ def test_remote_resource_assignments_are_limited_per_fleet():
         max_remote_workers=1,
     )
     assert len(targets) == 1
+
+
+def test_six_safe_workers_use_two_reachable_remote_resource_slots():
+    workers = tuple(
+        worker_view((uid - 1, 0), uid=uid)
+        for uid in range(2, 8)
+    )
+    memory = ScoutMemory()
+    turn = make_turn(
+        resources=0,
+        objects=(
+            core_view(),
+            *workers,
+            terrain("RESOURCE", [(25, 0), (25, 1)]),
+        ),
+    )
+    decide(turn, memory)
+    assert len(memory.resource_assignments) == 2
+    assert memory.last_intents["mining"] == 2
+
+
+def test_five_workers_keep_one_remote_resource_slot():
+    workers = tuple(
+        worker_view((uid - 1, 0), uid=uid)
+        for uid in range(2, 7)
+    )
+    memory = ScoutMemory()
+    turn = make_turn(
+        resources=0,
+        objects=(
+            core_view(),
+            *workers,
+            terrain("RESOURCE", [(25, 0), (25, 1)]),
+        ),
+    )
+    decide(turn, memory)
+    assert len(memory.resource_assignments) == 1
+    assert memory.last_intents["mining"] == 1
+
+
+def test_visible_combat_enemy_keeps_one_remote_resource_slot():
+    workers = tuple(
+        worker_view((uid - 1, 0), uid=uid)
+        for uid in range(2, 8)
+    )
+    memory = ScoutMemory()
+    turn = make_turn(
+        resources=0,
+        objects=(
+            core_view(),
+            *workers,
+            terrain("RESOURCE", [(25, 0), (25, 1)]),
+            enemy_view((0, 5)),
+        ),
+    )
+    decide(turn, memory)
+    assert len(memory.resource_assignments) == 1
+    assert memory.last_intents["mining"] == 1
+
+
+def test_recent_defense_caution_keeps_one_remote_resource_slot():
+    workers = tuple(
+        worker_view((uid - 1, 0), uid=uid)
+        for uid in range(2, 8)
+    )
+    memory = ScoutMemory(core_threat_until_tick=100)
+    turn = make_turn(
+        resources=0,
+        tick=100,
+        objects=(
+            core_view(),
+            *workers,
+            terrain("RESOURCE", [(25, 0), (25, 1)]),
+        ),
+    )
+    decide(turn, memory)
+    assert len(memory.resource_assignments) == 1
+    assert memory.last_intents["mining"] == 1
+
+
+def test_returning_remote_worker_uses_one_of_two_adaptive_slots():
+    memory = ScoutMemory()
+    turn = make_turn(
+        resources=0,
+        objects=(
+            core_view(),
+            worker_view((30, 0), cargo=1, uid=2),
+            *(worker_view((uid - 2, 0), uid=uid) for uid in range(3, 8)),
+            terrain("RESOURCE", [(25, 0), (25, 1)]),
+        ),
+    )
+    decide(turn, memory)
+    assert len(memory.resource_assignments) == 1
+    assert memory.last_intents["mining"] == 1
 
 
 def test_returning_remote_worker_consumes_the_fleet_expedition_slot():
@@ -3165,3 +3333,119 @@ def test_retreating_worker_does_not_block_the_emergency_defender():
     decide(turn, ScoutMemory())
     assert core_action_type(turn) == "SpawnAction"
     assert turn.plan.core_action.unit_type is not UnitType.WORKER
+
+
+def test_non_guard_worker_does_not_cross_core_and_block_emergency_spawn():
+    from tactic import projected_unit_position
+
+    turn = make_turn(
+        resources=12,
+        objects=(
+            core_view(position=(0, 0), shield=2),
+            worker_view((-1, 0), uid=2),
+            worker_view((0, -1), uid=3),
+            terrain("RESOURCE", [(0, 2)]),
+            enemy_view((2, 0), uid=90),
+        ),
+    )
+    decide(turn, ScoutMemory())
+    assert core_action_type(turn) == "SpawnAction"
+    assert projected_unit_position(turn.unit(U(3)), turn.plan) != (0, 0)
+
+
+def test_cargo_worker_evacuates_core_cell_for_emergency_spawn():
+    turn = make_turn(
+        resources=12,
+        objects=(
+            core_view(position=(0, 0), shield=2),
+            worker_view((0, 0), cargo=1, uid=2),
+            enemy_view((2, 0), uid=90),
+        ),
+    )
+    memory = ScoutMemory()
+    decide(turn, memory)
+    assert action_type(turn.plan, 2) == "MoveAction"
+    assert memory.last_intents["evacuating"] == 1
+    assert core_action_type(turn) == "SpawnAction"
+
+
+def test_underfunded_core_accepts_cargo_then_clears_for_spawn_next_tick():
+    memory = ScoutMemory()
+    deposit_turn = make_turn(
+        tick=100,
+        resources=8,
+        objects=(
+            core_view(position=(0, 0), shield=2),
+            worker_view((0, 0), cargo=2, uid=2),
+            enemy_view((2, 0), uid=90),
+        ),
+    )
+    decide(deposit_turn, memory)
+    assert action_type(deposit_turn.plan, 2) == "DepositAction"
+    assert core_action_type(deposit_turn) == "WaitAction"
+
+    funded_turn = make_turn(
+        tick=101,
+        resources=10,
+        objects=(
+            core_view(position=(0, 0), shield=2),
+            worker_view((0, 0), cargo=0, uid=2),
+            enemy_view((1, 0), uid=90),
+        ),
+    )
+    decide(funded_turn, memory)
+    assert action_type(funded_turn.plan, 2) == "MoveAction"
+    assert core_action_type(funded_turn) == "SpawnAction"
+
+
+def test_underfunded_core_allows_adjacent_cargo_worker_to_enter():
+    turn = make_turn(
+        resources=8,
+        objects=(
+            core_view(position=(0, 0), shield=2),
+            worker_view((-1, 0), cargo=2, uid=2),
+            enemy_view((2, 0), uid=90),
+        ),
+    )
+    decide(turn, ScoutMemory())
+    assert action_type(turn.plan, 2) == "MoveAction"
+    assert direction_of(turn.plan, 2) is Direction.RIGHT
+    assert core_action_type(turn) == "WaitAction"
+
+
+def test_core_danger_does_not_guard_from_the_wrong_approach_side():
+    memory = ScoutMemory()
+    turn = make_turn(
+        resources=8,
+        objects=(
+            core_view(position=(0, 0), shield=2),
+            worker_view((-2, 0), uid=2),
+            worker_view((0, 5), uid=3),
+            worker_view((1, 5), uid=4),
+            worker_view((-1, 5), uid=5),
+            worker_view((0, 6), uid=6),
+            worker_view((1, 6), uid=7),
+            enemy_view((2, 0), uid=90),
+        ),
+    )
+    decide(turn, memory)
+    assert memory.last_intents["guarding"] == 0
+    assert memory.last_intents["scouting"] == 5
+    assert memory.last_intents["evading"] == 1
+    assert direction_of(turn.plan, 2) is Direction.RIGHT
+
+
+def test_core_danger_holds_one_worker_already_blocking_vanguard_approach():
+    memory = ScoutMemory()
+    turn = make_turn(
+        resources=8,
+        objects=(
+            core_view(position=(0, 0), shield=2),
+            worker_view((1, 0), uid=2),
+            worker_view((0, 5), uid=3),
+            enemy_view((3, 0), uid=90),
+        ),
+    )
+    decide(turn, memory)
+    assert memory.last_intents["guarding"] == 1
+    assert action_type(turn.plan, 2) == "WaitAction"

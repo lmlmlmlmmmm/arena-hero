@@ -62,6 +62,8 @@ PATH_COST_UNREACHABLE = 1_000_000
 RESOURCE_MAX_ASSIGNMENT_COST = 64
 RESOURCE_LOCAL_RETURN_DISTANCE = 24
 RESOURCE_REMOTE_WORKERS_PER_FLEET = 4
+RESOURCE_ADAPTIVE_REMOTE_MIN_WORKERS = 6
+RESOURCE_ADAPTIVE_REMOTE_LIMIT = 2
 RESOURCE_TRIP_COST_HEALTHY = 72
 RESOURCE_TRIP_COST_NORMAL = 60
 RESOURCE_TRIP_COST_RECOVERY = 48
@@ -214,6 +216,7 @@ class ScoutMemory:
     core_threat_until_tick: int = 0
     core_intercept_worker_id: str | None = None
     last_migration_hold: str | None = None
+    last_defense_status: str | None = None
     path: Path | None = None
     dirty: bool = False
     last_saved_tick: int = -1
@@ -1671,12 +1674,13 @@ def observe(turn, memory: ScoutMemory) -> Counter:
                 flow["other"] += amount
         if is_failure(event.event_type):
             log.warning(
-                "tick=%d rejected event=%s reason=%s actor=%s position=%s",
+                "tick=%d rejected event=%s reason=%s actor=%s position=%s values=%s",
                 turn.tick,
                 event.event_type,
                 event.reason_code,
                 str(event.actor_id)[:8] if event.actor_id is not None else None,
                 event.position,
+                event.values,
             )
             if (
                 event.event_type == "HARVEST_FAILED"
@@ -1734,6 +1738,12 @@ def observe(turn, memory: ScoutMemory) -> Counter:
                 event.position,
                 event.values,
             )
+        elif event.event_type == "CORE_SPAWN_SUCCEEDED":
+            log.info(
+                "tick=%d core spawn succeeded values=%s",
+                turn.tick,
+                event.values,
+            )
     living_worker_ids = {str(worker.id) for worker in turn.workers}
     memory.prune_workers(living_worker_ids)
     memory.expire(turn.tick, living_worker_ids)
@@ -1789,7 +1799,7 @@ def resource_round_trip_budget(turn, memory: ScoutMemory) -> int:
 
     A stalled or underfunded economy tightens to nearby nodes so it cannot
     repeat a fleet-wide long haul.  Once recent deliveries demonstrate healthy
-    throughput, the single remote expedition slot may range farther.
+    throughput, the bounded remote expeditions may range farther.
     """
 
     totals = memory.economic_totals(turn.tick)
@@ -1801,6 +1811,37 @@ def resource_round_trip_budget(turn, memory: ScoutMemory) -> int:
     if totals["income"] >= healthy_income and totals["lost"] == 0:
         return RESOURCE_TRIP_COST_HEALTHY
     return RESOURCE_TRIP_COST_NORMAL
+
+
+def remote_worker_limit(
+    workers,
+    resources: set[Position],
+    depot: Position,
+    blocked: set[Position],
+    hostile_units: tuple[UnitView, ...],
+    defense_caution: bool,
+) -> int:
+    """Allow a second remote expedition only for a safe, established fleet."""
+
+    worker_count = len(workers)
+    limit = max(1, worker_count // RESOURCE_REMOTE_WORKERS_PER_FLEET)
+    if (
+        worker_count < RESOURCE_ADAPTIVE_REMOTE_MIN_WORKERS
+        or hostile_units
+        or defense_caution
+    ):
+        return limit
+    remote_resources = 0
+    for cell in resources:
+        cost = bounded_route_cost(cell, depot, blocked)
+        if cost is None or cost <= RESOURCE_LOCAL_RETURN_DISTANCE:
+            continue
+        remote_resources += 1
+        if remote_resources >= RESOURCE_ADAPTIVE_REMOTE_LIMIT:
+            break
+    if remote_resources >= RESOURCE_ADAPTIVE_REMOTE_LIMIT:
+        limit = max(limit, RESOURCE_ADAPTIVE_REMOTE_LIMIT)
+    return min(limit, max(1, worker_count // 2))
 
 
 def core_is_stationary(turn) -> bool:
@@ -1889,6 +1930,58 @@ def defender_reserve_cost(
     return min(
         unit_cost(UnitType.VANGUARD, turn.state.population),
         unit_cost(UnitType.RANGER, turn.state.population),
+    )
+
+
+def defender_reserve_target(turn) -> tuple[UnitType, int]:
+    """Return the cheapest dynamically priced combat Unit and its price."""
+
+    candidates = (
+        (UnitType.VANGUARD, unit_cost(UnitType.VANGUARD, turn.state.population)),
+        (UnitType.RANGER, unit_cost(UnitType.RANGER, turn.state.population)),
+    )
+    return min(candidates, key=lambda candidate: (candidate[1], candidate[0].value))
+
+
+def summarize_defense_decision(
+    turn,
+    enemies: tuple[CoreView | UnitView, ...],
+    core_budget: int,
+) -> str | None:
+    """Describe the active defender reserve and the Core decision it produced."""
+
+    reserve = defender_reserve_cost(turn, enemies)
+    if reserve == 0 or turn.core is None:
+        return None
+    target, price = defender_reserve_target(turn)
+    cell_open = spawn_cell_open(turn)
+    action = turn.plan.core_action
+    spawned_type = getattr(action, "unit_type", None)
+    action_name = (
+        type(action).__name__.removesuffix("Action").lower()
+        if action is not None
+        else "none"
+    )
+    if spawned_type is not None:
+        decision = f"spawn:{spawned_type.value}"
+    elif action_name == "heal" and turn.core.hp <= CRITICAL_CORE_HP:
+        decision = "heal:critical"
+    elif action_name == "repairshield":
+        decision = "repair_shield"
+    else:
+        decision = action_name
+    spawn_blockers: list[str] = []
+    if not core_is_stationary(turn):
+        spawn_blockers.append("core_moving")
+    if core_budget < price:
+        spawn_blockers.append(f"funds={price - core_budget}")
+    if not cell_open:
+        spawn_blockers.append("spawn_cell")
+    return (
+        f"defense[reserve:{reserve},reserve_target:{target.value}@{price},"
+        f"bank:{core_budget},cell:{'open' if cell_open else 'blocked'},"
+        f"spawn_blockers:{'+'.join(spawn_blockers) if spawn_blockers else '-'},"
+        f"decision:{decision}]"
     )
 
 
@@ -2321,11 +2414,20 @@ def plan_worker(
     scout_goal: Position | None = None,
     hard_blocked: set[Position] | None = None,
     retreat: bool = False,
+    guard_core: bool = False,
+    preserve_spawn_cell: bool = False,
 ) -> None:
     position = worker.position
     worker_id = str(worker.id)
 
     if worker.cargo > 0:
+        if preserve_spawn_cell and position == core_position:
+            staging = beacon_hold_waypoint(
+                core_position,
+                blocked | reservations.destinations,
+            )
+            move_or_wait(worker, staging, blocked, reservations)
+            return
         if core_receptive and position == core_position:
             if budget.space > 0:
                 amount = min(worker.cargo, budget.space)
@@ -2376,8 +2478,11 @@ def plan_worker(
         )
         return
 
-    if danger and manhattan(position, core_position) > 1:
-        move_or_wait(worker, core_position, blocked, reservations)
+    if guard_core:
+        if manhattan(position, core_position) > 1:
+            move_or_wait(worker, core_position, blocked, reservations)
+        else:
+            worker.wait()
         return
 
     if resource_target is not None:
@@ -2662,6 +2767,43 @@ def worker_should_retreat(worker, hostile_units) -> bool:
     )
 
 
+def choose_danger_worker_guard(
+    workers,
+    core_position: Position,
+    worker_blocked: set[Position],
+    excluded_ids: set[UUID],
+    hostile_units: tuple[UnitView, ...],
+) -> UUID | None:
+    """Hold one safe Worker only when it already blocks a Vanguard approach."""
+
+    approach_cells: set[Position] = set()
+    for enemy in hostile_units:
+        if enemy.unit_type is not UnitType.VANGUARD:
+            continue
+        current_distance = manhattan(core_position, enemy.position)
+        for direction in DIRECTION_ORDER:
+            dx, dy = DIRECTION_DELTAS[direction]
+            cell = (core_position[0] + dx, core_position[1] + dy)
+            if manhattan(cell, enemy.position) < current_distance:
+                approach_cells.add(cell)
+
+    candidates = (
+        worker
+        for worker in workers
+        if worker.id not in excluded_ids
+        and worker.cargo == 0
+        and worker.hp == max_hp(worker)
+        and worker.position not in worker_blocked
+        and worker.position in approach_cells
+    )
+    guard = min(
+        candidates,
+        key=lambda worker: (manhattan(worker.position, core_position), str(worker.id)),
+        default=None,
+    )
+    return guard.id if guard is not None else None
+
+
 def decide(turn, memory: ScoutMemory | None = None) -> None:
     """Queue one complete plan for the Turn using the balanced policy."""
 
@@ -2669,6 +2811,7 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
         memory = ScoutMemory()
     memory.last_intents = Counter()
     memory.last_migration_hold = None
+    memory.last_defense_status = None
     observe(turn, memory)
     if turn.state.status is not PlayerStatus.ACTIVE or turn.core is None:
         for unit in turn.units:
@@ -2709,8 +2852,11 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
         )
         memory.dirty |= memory.core_threat_until_tick != previous_caution
     defense_caution = turn.tick <= memory.core_threat_until_tick
+    worker_travel_blocked = worker_blocked | ({core_position} if danger else set())
+    worker_hard_blocked = blocked | ({core_position} if danger else set())
 
     budget = TickBudget(resources=turn.resources, space=turn.resource_space)
+    defense_reserve = defender_reserve_cost(turn, enemies)
     reservations = MovementReservations(destinations=set(memory.contested))
     if memory.contested:
         log.info("tick=%d backoff contested=%s", turn.tick, sorted(memory.contested))
@@ -2744,7 +2890,20 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
         key=lambda worker: (manhattan(worker.position, return_position), str(worker.id)),
     )
     for worker in cargo_workers:
-        if core_receptive and worker.position == core_position and budget.space > 0:
+        preserve_spawn_cell = (
+            danger
+            and defense_reserve > 0
+            and budget.resources >= defense_reserve
+        )
+        cargo_travel_blocked = (
+            worker_travel_blocked if preserve_spawn_cell else worker_blocked
+        )
+        cargo_hard_blocked = (
+            worker_hard_blocked if preserve_spawn_cell else blocked
+        )
+        if preserve_spawn_cell and worker.position == core_position:
+            intents["evacuating"] += 1
+        elif core_receptive and worker.position == core_position and budget.space > 0:
             intents["depositing"] += 1
         else:
             intents["returning"] += 1
@@ -2755,16 +2914,16 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
         ):
             staging = beacon_hold_waypoint(
                 return_position,
-                blocked | reservations.destinations | {core_position},
+                cargo_hard_blocked | reservations.destinations | {core_position},
             )
-            move_or_wait(worker, staging, blocked, reservations)
+            move_or_wait(worker, staging, cargo_hard_blocked, reservations)
             continue
-        avoid = worker_blocked
+        avoid = cargo_travel_blocked
         if memory.is_looping(str(worker.id)):
             # Shuffling between the same two cells delivers nothing, so a stuck
             # carrier stops respecting threat arcs and takes the direct route.
             # One point of damage costs less than an expedition that never ends.
-            avoid = blocked
+            avoid = cargo_hard_blocked
             intents["loop_breaking"] += 1
             log.info(
                 "tick=%d worker %s loops with cargo at %s; ignoring threat arcs",
@@ -2785,13 +2944,26 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
             danger,
             budget,
             memory,
-            hard_blocked=blocked,
+            hard_blocked=cargo_hard_blocked,
             retreat=worker_should_retreat(worker, hostile_units),
+            preserve_spawn_cell=preserve_spawn_cell,
         )
 
     # Deposits resolve before healing and the Core action. Planning them first
     # makes their same-Tick budget available without assuming a move can deposit.
     healed = plan_unit_heals(turn, budget, danger, intents)
+
+    danger_guard_id = (
+        choose_danger_worker_guard(
+            turn.workers,
+            core_position,
+            worker_travel_blocked,
+            healed | ({claimer_id} if claimer_id is not None else set()),
+            hostile_units,
+        )
+        if danger
+        else None
+    )
 
     mining_workers = [
         worker
@@ -2799,18 +2971,22 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
         if worker.id not in healed
         and worker.id != claimer_id
         and worker.cargo == 0
-        and not (danger and manhattan(worker.position, core_position) > 1)
+        and worker.id != danger_guard_id
     ]
     refresh_resource_progress(
         mining_workers,
         resources,
-        worker_blocked,
+        worker_travel_blocked,
         turn.tick,
         memory,
     )
-    remote_worker_limit = max(
-        1,
-        len(turn.workers) // RESOURCE_REMOTE_WORKERS_PER_FLEET,
+    max_remote_workers = remote_worker_limit(
+        turn.workers,
+        resources,
+        return_position,
+        worker_travel_blocked,
+        hostile_units,
+        defense_caution,
     )
     remote_commitments = sum(
         manhattan(worker.position, return_position) > RESOURCE_LOCAL_RETURN_DISTANCE
@@ -2823,7 +2999,7 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
         return assign_resource_targets(
             mining_workers,
             resources,
-            worker_blocked,
+            worker_travel_blocked,
             memory.resource_assignments,
             depot=return_position,
             max_total_cost=max_total_cost,
@@ -2834,7 +3010,7 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
             max_remote_workers=max_remote_workers,
         )
 
-    remote_slots = max(0, remote_worker_limit - remote_commitments)
+    remote_slots = max(0, max_remote_workers - remote_commitments)
     resource_targets = assign(trip_budget, remote_slots)
     if (
         not resource_targets
@@ -2844,7 +3020,7 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
     ):
         # The drought budget tightens trips to protect a weak economy, but when it
         # refuses every node the fleet walks past food it already found.  Raise the
-        # cost cap only; the fleet-wide expedition slot still applies.
+        # cost cap only; the fleet-wide expedition limit still applies.
         resource_targets = assign(RESOURCE_TRIP_COST_HEALTHY, remote_slots)
         if resource_targets:
             memory.last_trip_budget = RESOURCE_TRIP_COST_HEALTHY
@@ -2867,7 +3043,7 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
             worker = next(
                 worker for worker in mining_workers if str(worker.id) == worker_id
             )
-            cost = bounded_route_cost(worker.position, target, worker_blocked)
+            cost = bounded_route_cost(worker.position, target, worker_travel_blocked)
             memory.resource_progress[worker_id] = ResourceProgress(
                 target,
                 cost if cost is not None else PATH_COST_UNREACHABLE,
@@ -2881,7 +3057,7 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
     if resource_targets:
         assignments = ",".join(
             f"{str(worker_id)[:8]}->{target}@"
-            f"{bounded_route_cost(turn.unit(worker_id).position, target, worker_blocked)}"
+            f"{bounded_route_cost(turn.unit(worker_id).position, target, worker_travel_blocked)}"
             for worker_id, target in sorted(resource_targets.items(), key=lambda item: str(item[0]))
         )
         log.debug(
@@ -2926,7 +3102,7 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
             beacon,
             core_position,
             beacon_hold_waypoint(core_position, blocked | reservations.destinations),
-            worker_blocked if claimer.unit_type is UnitType.WORKER else blocked,
+            worker_travel_blocked if claimer.unit_type is UnitType.WORKER else blocked,
             reservations,
         )
     for worker in miners:
@@ -2937,14 +3113,14 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
             core_position,
             return_position,
             core_receptive,
-            worker_blocked,
+            worker_travel_blocked,
             reservations,
             resource_targets[worker.id],
             visible_resources,
             danger,
             budget,
             memory,
-            hard_blocked=blocked,
+            hard_blocked=worker_hard_blocked,
             retreat=worker_should_retreat(worker, hostile_units),
         )
 
@@ -3028,10 +3204,13 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
             memory.scout_targets.pop(worker_id, None)
             memory.dirty = True
             intents["recalling"] += 1
-            move_or_wait(worker, core_position, worker_blocked, reservations)
+            move_or_wait(worker, core_position, worker_travel_blocked, reservations)
             continue
-        if danger and manhattan(worker.position, core_position) > 1:
+        retreating = worker_should_retreat(worker, hostile_units)
+        if worker.id == danger_guard_id:
             intents["guarding"] += 1
+        elif retreating:
+            intents["evading"] += 1
         else:
             intents["scouting"] += 1
         plan_worker(
@@ -3040,7 +3219,7 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
             core_position,
             return_position,
             core_receptive,
-            worker_blocked,
+            worker_travel_blocked,
             reservations,
             None,
             visible_resources,
@@ -3053,11 +3232,12 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
                 memory,
                 claimed_scout_cells,
                 turn.tick,
-                worker_blocked,
+                worker_travel_blocked,
                 scout_radius,
             ),
-            hard_blocked=blocked,
-            retreat=worker_should_retreat(worker, hostile_units),
+            hard_blocked=worker_hard_blocked,
+            retreat=retreating,
+            guard_core=worker.id == danger_guard_id,
         )
 
     activity_points: list[Position] = []
@@ -3070,6 +3250,7 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
         activity_points.extend((cell, cell))
     active_economic_workers = len(cargo_workers) + len(miners)
 
+    core_budget = budget.resources
     plan_core(
         turn,
         enemies,
@@ -3082,6 +3263,11 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
         defense_caution,
         memory,
         intents,
+    )
+    memory.last_defense_status = summarize_defense_decision(
+        turn,
+        enemies,
+        core_budget,
     )
 
     if reservations.by_unit:
@@ -3119,6 +3305,15 @@ def summarize(plan) -> str:
     core = type(plan.core_action).__name__.removesuffix("Action") if plan.core_action else None
     parts = ",".join(f"{name}:{count}" for name, count in sorted(counts.items()))
     return f"units[{parts or 'none'}] core[{core or 'none'}]"
+
+
+def summarize_fleet(turn) -> str:
+    """Expose the living composition hidden by the aggregate population."""
+
+    return (
+        f"fleet[w:{len(turn.workers)},v:{len(turn.vanguards)},"
+        f"r:{len(turn.rangers)}]"
+    )
 
 
 def summarize_events(counts: Counter) -> str:
@@ -3325,17 +3520,19 @@ def main() -> None:
             memory.save(turn.tick)
             deposit_eta = nearest_deposit_eta(turn, memory.known_obstacles)
             log.info(
-                "tick=%d status=%s resources=%d/%d pop=%d %s %s %s %s map[r:%d,o:%d] "
+                "tick=%d status=%s resources=%d/%d pop=%d %s %s %s %s %s %s map[r:%d,o:%d] "
                 "deposit_eta=%s hold=%s plan_ms=%.1f %s %s",
                 turn.tick,
                 turn.state.status.value,
                 turn.resources,
                 turn.resource_capacity,
                 turn.state.population,
+                summarize_fleet(turn),
                 summarize_intents(memory.last_intents),
                 summarize_resource_flow(memory.last_resource_flow),
                 summarize_economy(memory, turn.tick),
                 summarize_core_state(turn, memory.known_obstacles),
+                memory.last_defense_status or "defense[-]",
                 len(memory.known_resources),
                 len(memory.known_obstacles),
                 deposit_eta if deposit_eta is not None else "-",
