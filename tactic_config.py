@@ -152,7 +152,8 @@ VANGUARD_PATROL_RADIUS = 5
 
 # General pursuit is intentionally smaller than the scouting disc.  Immediate
 # Core threats still receive the whole defense force, while ordinary visible
-# targets can draw only a pair of hunters and cannot lure them arbitrarily far.
+# targets can draw only a pair of hunters while they remain inside the Core's
+# pursuit radius, so a retreating target cannot lure those hunters outward.
 COMBAT_PURSUIT_DISTANCE = 16
 COMBAT_PURSUIT_HUNTERS = 2
 

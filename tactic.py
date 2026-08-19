@@ -2764,6 +2764,8 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
                 for enemy in enemies
                 if manhattan(unit.position, enemy.position)
                 <= COMBAT_PURSUIT_DISTANCE
+                and manhattan(core_position, enemy.position)
+                <= COMBAT_PURSUIT_DISTANCE
             )
             if engagement_targets:
                 intents["engaging"] += 1

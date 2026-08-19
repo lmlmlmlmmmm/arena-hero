@@ -2896,6 +2896,38 @@ def test_ordinary_enemy_inside_the_leash_draws_only_two_hunters():
     assert memory.last_intents["limited_pursuit"] == 2
 
 
+def test_ordinary_target_crossing_the_core_leash_ends_the_pursuit():
+    memory = ScoutMemory()
+    states = (
+        ((14, 0), (15, 0), "SweepAction", Direction.RIGHT, 0),
+        ((14, 0), (16, 0), "MoveAction", Direction.RIGHT, 1),
+        ((15, 0), (17, 0), "MoveAction", Direction.LEFT, 0),
+    )
+    for tick, (hunter_position, enemy_position, action, direction, pursuits) in enumerate(
+        states,
+        start=100,
+    ):
+        turn = make_turn(
+            resources=0,
+            tick=tick,
+            objects=(
+                core_view(),
+                worker_view((0, 5), uid=2),
+                vanguard_view((0, 2), uid=4),
+                vanguard_view(hunter_position, uid=5),
+                enemy_view(
+                    enemy_position,
+                    uid=90,
+                    unit_type=UnitType.WORKER,
+                ),
+            ),
+        )
+        decide(turn, memory)
+        assert action_type(turn.plan, 5) == action
+        assert direction_of(turn.plan, 5) is direction
+        assert memory.last_intents["limited_pursuit"] == pursuits
+
+
 def test_immediate_core_threat_draws_the_full_combat_fleet():
     memory = ScoutMemory()
     defenders = tuple(
