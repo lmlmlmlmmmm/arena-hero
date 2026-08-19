@@ -1552,7 +1552,23 @@ def start_economic_core_move(
         return False
 
     core = turn.core
-    if core is None or not core_is_stationary(turn):
+    if core is None:
+        return hold("core_not_stationary")
+    # Normalize legacy persisted density goals before any economic early-return
+    # gate (cargo arrival, repair, or danger) can leave a multi-hour target in
+    # telemetry or resume it on a later Tick.
+    if (
+        memory.core_migration_goal_kind == "density"
+        and memory.core_migration_goal is not None
+        and manhattan(core.position, memory.core_migration_goal)
+        > CORE_DENSITY_MILESTONE_DISTANCE
+    ):
+        remember_core_migration_goal(
+            memory,
+            core_migration_milestone(core.position, memory.core_migration_goal),
+            "density",
+        )
+    if not core_is_stationary(turn):
         return hold("core_not_stationary")
     cargo_workers = sorted(
         (worker for worker in turn.workers if worker.cargo > 0),

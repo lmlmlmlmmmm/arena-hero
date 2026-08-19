@@ -2535,6 +2535,23 @@ def test_legacy_long_density_goal_is_trimmed_before_migration_resumes():
     assert core_action_type(turn) == "StartMoveAction"
 
 
+def test_legacy_density_goal_is_trimmed_even_while_waiting_for_cargo():
+    memory = ScoutMemory(
+        core_migration_goal=(0, 0),
+        core_migration_goal_kind="density",
+    )
+    turn = make_turn(
+        resources=0,
+        objects=(
+            core_view(position=(-800, 0)),
+            worker_view((-790, 0), cargo=1, uid=2),
+            *(worker_view((-790, uid), uid=uid) for uid in range(3, 7)),
+        ),
+    )
+    decide(turn, memory)
+    assert memory.core_migration_goal == (-768, 0)
+
+
 def test_reaching_density_milestone_forces_a_fresh_economic_evaluation():
     memory = ScoutMemory(
         core_migration_goal=(-768, 0),
