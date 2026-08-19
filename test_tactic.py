@@ -269,6 +269,41 @@ def test_core_spawns_worker_when_affordable():
     assert turn.plan.core_action.unit_type is UnitType.WORKER
 
 
+def test_safe_roster_waits_for_preferred_ranger_instead_of_cheaper_vanguard():
+    workers = tuple(worker_view((20 + uid, 0), uid=uid) for uid in range(2, 16))
+    vanguards = tuple(vanguard_view((uid, 2), uid=uid) for uid in range(16, 20))
+    turn = make_turn(
+        resources=12,
+        objects=(core_view(), *workers, *vanguards),
+    )
+    decide(turn)
+    assert core_action_type(turn) == "WaitAction"
+
+
+def test_safe_roster_spawns_preferred_ranger_after_heal_reserve_is_funded():
+    workers = tuple(worker_view((20 + uid, 0), uid=uid) for uid in range(2, 16))
+    vanguards = tuple(vanguard_view((uid, 2), uid=uid) for uid in range(16, 20))
+    turn = make_turn(
+        resources=14,
+        objects=(core_view(), *workers, *vanguards),
+    )
+    decide(turn)
+    assert core_action_type(turn) == "SpawnAction"
+    assert turn.plan.core_action.unit_type is UnitType.RANGER
+
+
+def test_legacy_twenty_unit_roster_adds_missing_ranged_coverage():
+    workers = tuple(worker_view((20 + uid, 0), uid=uid) for uid in range(2, 16))
+    vanguards = tuple(vanguard_view((uid, 2), uid=uid) for uid in range(16, 22))
+    turn = make_turn(
+        resources=18,
+        objects=(core_view(), *workers, *vanguards),
+    )
+    decide(turn)
+    assert core_action_type(turn) == "SpawnAction"
+    assert turn.plan.core_action.unit_type is UnitType.RANGER
+
+
 def test_core_heals_when_damaged():
     turn = make_turn(
         resources=10,
@@ -372,6 +407,79 @@ def test_defense_telemetry_reports_the_reserved_defender_shortfall():
     assert "reserve_target:VANGUARD@10" in memory.last_defense_status
     assert "spawn_blockers:funds=2" in memory.last_defense_status
     assert "decision:wait" in memory.last_defense_status
+
+
+def test_defense_telemetry_reports_policy_population_cap():
+    memory = ScoutMemory()
+    workers = tuple(worker_view((20 + uid, 0), uid=uid) for uid in range(2, 16))
+    vanguards = tuple(vanguard_view((uid, 2), uid=uid) for uid in range(16, 20))
+    rangers = tuple(ranger_view((uid, 3), uid=uid) for uid in range(20, 22))
+    turn = make_turn(
+        resources=18,
+        objects=(
+            core_view(),
+            *workers,
+            *vanguards,
+            *rangers,
+            enemy_view((9, 0)),
+        ),
+    )
+    decide(turn, memory)
+    assert memory.last_defense_status is not None
+    assert "spawn_blockers:policy_population_cap" in memory.last_defense_status
+
+
+def test_defense_telemetry_prices_the_only_policy_approved_defender():
+    memory = ScoutMemory()
+    workers = tuple(worker_view((20 + uid, 0), uid=uid) for uid in range(2, 16))
+    vanguards = tuple(vanguard_view((uid, 2), uid=uid) for uid in range(16, 20))
+    turn = make_turn(
+        resources=11,
+        objects=(
+            core_view(),
+            *workers,
+            *vanguards,
+            enemy_view((9, 0)),
+        ),
+    )
+    decide(turn, memory)
+    assert memory.last_defense_status is not None
+    assert "reserve_target:RANGER@12" in memory.last_defense_status
+    assert "spawn_blockers:funds=1" in memory.last_defense_status
+
+
+def test_safe_ranger_reserve_outranks_nonessential_shield_repair():
+    workers = tuple(worker_view((20 + uid, 0), uid=uid) for uid in range(2, 16))
+    vanguards = tuple(vanguard_view((uid, 2), uid=uid) for uid in range(16, 20))
+    turn = make_turn(
+        resources=12,
+        objects=(
+            core_view(shield=4),
+            *workers,
+            *vanguards,
+            enemy_view((9, 0)),
+        ),
+    )
+    decide(turn)
+    assert core_action_type(turn) == "SpawnAction"
+    assert turn.plan.core_action.unit_type is UnitType.RANGER
+
+
+def test_unit_heals_preserve_the_only_policy_approved_defender_price():
+    from tactic import unit_heal_reserve
+
+    workers = tuple(worker_view((20 + uid, 0), uid=uid) for uid in range(2, 16))
+    vanguards = tuple(vanguard_view((uid, 2), uid=uid) for uid in range(16, 20))
+    turn = make_turn(
+        resources=12,
+        objects=(
+            core_view(),
+            *workers,
+            *vanguards,
+            enemy_view((9, 0)),
+        ),
+    )
+    assert unit_heal_reserve(turn, danger=False) == 12
 
 
 def test_defense_telemetry_reports_a_blocked_spawn_cell():
@@ -1452,7 +1560,10 @@ def test_only_guard_is_not_diverted_to_pick_up_the_beacon():
 
 def test_completed_roster_repairs_beacon_shield_above_five():
     workers = tuple(worker_view((20 + uid, 0), uid=uid) for uid in range(2, 16))
-    defenders = tuple(vanguard_view((uid, 2), uid=uid) for uid in range(16, 22))
+    defenders = (
+        *(vanguard_view((uid, 2), uid=uid) for uid in range(16, 20)),
+        *(ranger_view((uid, 3), uid=uid) for uid in range(20, 22)),
+    )
     turn = make_turn(
         resources=10,
         objects=(core_view(shield=5), *workers, *defenders),
@@ -1962,6 +2073,205 @@ def test_core_keeps_the_same_cargo_intercept_target_between_steps():
     assert core_action_type(turn) == "StartMoveAction"
     assert turn.plan.core_action.direction is Direction.RIGHT
     assert memory.core_intercept_worker_id == str(U(3))
+
+
+def attempt_economic_core_move(
+    memory: ScoutMemory,
+    *,
+    tick: int,
+    activity_points: list[tuple[int, int]],
+    objects: tuple | None = None,
+    active_economic_workers: int = 2,
+):
+    from tactic import MovementReservations, start_economic_core_move
+
+    turn = make_turn(
+        resources=0,
+        tick=tick,
+        objects=economic_migration_objects() if objects is None else objects,
+    )
+    started = start_economic_core_move(
+        turn,
+        (),
+        TickBudget(resources=0, space=10),
+        frozenset(),
+        set(),
+        MovementReservations(),
+        activity_points,
+        active_economic_workers,
+        False,
+        memory,
+        Counter(),
+    )
+    return turn, started
+
+
+def test_core_keeps_locked_migration_goal_when_activity_flips_behind_it():
+    memory = ScoutMemory(
+        core_migration_goal=(20, 0),
+        core_migration_goal_kind="activity",
+    )
+    turn, started = attempt_economic_core_move(
+        memory,
+        tick=105,
+        activity_points=[(-20, 0), (-20, 2)],
+    )
+    assert started is True
+    assert turn.plan.core_action.direction is Direction.RIGHT
+    assert memory.core_migration_goal == (20, 0)
+
+
+def test_density_migration_goal_clears_after_reaching_a_rich_chunk():
+    core_position = (-400, 0)
+    memory = ScoutMemory(
+        core_migration_goal=(0, 0),
+        core_migration_goal_kind="density",
+    )
+    objects = (
+        core_view(position=core_position),
+        *(worker_view((core_position[0] + uid, 0), uid=uid) for uid in range(2, 7)),
+    )
+    turn, started = attempt_economic_core_move(
+        memory,
+        tick=105,
+        activity_points=[],
+        objects=objects,
+    )
+    assert started is False
+    assert core_action_type(turn) is None
+    assert memory.core_migration_goal is None
+    assert memory.last_migration_hold == "goal_invalidated"
+
+
+def test_activity_migration_goal_clears_without_active_economic_workers():
+    memory = ScoutMemory(
+        core_migration_goal=(20, 0),
+        core_migration_goal_kind="activity",
+    )
+    turn, started = attempt_economic_core_move(
+        memory,
+        tick=105,
+        activity_points=[],
+        active_economic_workers=0,
+    )
+    assert started is False
+    assert core_action_type(turn) is None
+    assert memory.core_migration_goal is None
+    assert memory.last_migration_hold == "goal_invalidated"
+
+
+def test_activity_migration_goal_clears_when_its_chunk_becomes_poorer():
+    core_position = (-64, 0)
+    memory = ScoutMemory(
+        core_migration_goal=(400, 0),
+        core_migration_goal_kind="activity",
+    )
+    objects = (
+        core_view(position=core_position),
+        *(worker_view((core_position[0] + uid, 0), uid=uid) for uid in range(2, 7)),
+    )
+    turn, started = attempt_economic_core_move(
+        memory,
+        tick=105,
+        activity_points=[(400, 0), (400, 2)],
+        objects=objects,
+    )
+    assert started is False
+    assert core_action_type(turn) is None
+    assert memory.core_migration_goal is None
+    assert memory.last_migration_hold == "goal_invalidated"
+
+
+def test_queued_core_move_does_not_start_reverse_cooldown_before_resolution():
+    memory = ScoutMemory()
+    turn, started = attempt_economic_core_move(
+        memory,
+        tick=105,
+        activity_points=[(20, 0), (20, 2)],
+    )
+    assert started is True
+    assert core_action_type(turn) == "StartMoveAction"
+    assert memory.core_last_move_delta is None
+    assert memory.core_last_move_tick == -1
+
+
+def test_failed_or_cancelled_core_move_clears_reverse_cooldown():
+    from tactic import observe
+
+    for index, event_type in enumerate(("CORE_MOVE_FAILED", "CORE_MOVE_CANCELLED")):
+        event = ResolutionEvent(
+            event_id=U(80 + index),
+            tick=104,
+            event_type=event_type,
+            reason_code="MOVE_CONTESTED" if event_type.endswith("FAILED") else None,
+            actor_id=U(1),
+            position=(0, 0),
+        )
+        memory = ScoutMemory(
+            core_last_move_delta=(1, 0),
+            core_last_move_tick=100,
+        )
+        turn = make_turn(events=(event,), objects=(core_view(), worker_view((5, 0))))
+        observe(turn, memory)
+        assert memory.core_last_move_delta is None
+        assert memory.core_last_move_tick == -1
+
+
+def test_core_blocks_an_ordinary_reverse_during_migration_cooldown():
+    memory = ScoutMemory(
+        core_migration_goal=(-20, 0),
+        core_migration_goal_kind="activity",
+        core_last_move_delta=(1, 0),
+        core_last_move_tick=100,
+    )
+    turn, started = attempt_economic_core_move(
+        memory,
+        tick=111,
+        activity_points=[(-20, 0), (-20, 2)],
+    )
+    assert started is False
+    assert core_action_type(turn) is None
+    assert memory.last_migration_hold == "reverse_cooldown"
+
+
+def test_core_may_reverse_after_migration_cooldown():
+    memory = ScoutMemory(
+        core_migration_goal=(-20, 0),
+        core_migration_goal_kind="activity",
+        core_last_move_delta=(1, 0),
+        core_last_move_tick=100,
+    )
+    turn, started = attempt_economic_core_move(
+        memory,
+        tick=112,
+        activity_points=[(-20, 0), (-20, 2)],
+    )
+    assert started is True
+    assert turn.plan.core_action.direction is Direction.LEFT
+    assert memory.last_migration_hold is None
+
+
+def test_empty_core_may_reverse_immediately_to_intercept_cargo():
+    memory = ScoutMemory(
+        core_last_move_delta=(1, 0),
+        core_last_move_tick=100,
+    )
+    objects = (
+        core_view(),
+        worker_view((-20, 0), cargo=1, uid=2),
+        worker_view((10, 0), uid=3),
+        worker_view((11, 0), uid=4),
+        worker_view((12, 0), uid=5),
+    )
+    turn, started = attempt_economic_core_move(
+        memory,
+        tick=101,
+        activity_points=[(20, 0), (20, 2)],
+        objects=objects,
+    )
+    assert started is True
+    assert turn.plan.core_action.direction is Direction.LEFT
+    assert memory.core_intercept_worker_id == str(U(2))
 
 
 def test_understaffed_empty_core_still_intercepts_surviving_cargo():
@@ -3047,6 +3357,48 @@ def test_economic_history_survives_state_restart(tmp_path):
         lost=1,
         samples=1,
     )
+
+
+def test_core_migration_state_survives_state_restart(tmp_path):
+    path = tmp_path / "scout_state.json"
+    saved = ScoutMemory(
+        path=path,
+        core_identity=str(U(1)),
+        core_intercept_worker_id=str(U(2)),
+        core_migration_goal=(20, -8),
+        core_migration_goal_kind="activity",
+        core_last_move_delta=(1, 0),
+        core_last_move_tick=123,
+        dirty=True,
+    )
+    saved.save(force=True)
+
+    restored = ScoutMemory(path=path)
+    restored.load()
+    assert restored.core_identity == str(U(1))
+    assert restored.core_intercept_worker_id == str(U(2))
+    assert restored.core_migration_goal == (20, -8)
+    assert restored.core_migration_goal_kind == "activity"
+    assert restored.core_last_move_delta == (1, 0)
+    assert restored.core_last_move_tick == 123
+
+
+def test_replacement_core_clears_persisted_migration_state():
+    memory = ScoutMemory(
+        core_identity=str(U(1)),
+        core_intercept_worker_id=str(U(2)),
+        core_migration_goal=(20, -8),
+        core_migration_goal_kind="activity",
+        core_last_move_delta=(1, 0),
+        core_last_move_tick=123,
+    )
+    memory.sync_core_identity(str(U(99)))
+    assert memory.core_identity == str(U(99))
+    assert memory.core_intercept_worker_id is None
+    assert memory.core_migration_goal is None
+    assert memory.core_migration_goal_kind is None
+    assert memory.core_last_move_delta is None
+    assert memory.core_last_move_tick == -1
 
 
 def test_scout_coverage_discards_the_oldest_cells_at_hard_limit(monkeypatch):

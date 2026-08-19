@@ -100,6 +100,11 @@ class ScoutMemory:
     last_trip_budget: int = RESOURCE_TRIP_COST_NORMAL
     core_threat_until_tick: int = 0
     core_intercept_worker_id: str | None = None
+    core_identity: str | None = None
+    core_migration_goal: Position | None = None
+    core_migration_goal_kind: str | None = None
+    core_last_move_delta: Position | None = None
+    core_last_move_tick: int = -1
     last_migration_hold: str | None = None
     last_defense_status: str | None = None
     path: Path | None = None
@@ -233,6 +238,33 @@ class ScoutMemory:
             raw_intercept_worker_id
             if isinstance(raw_intercept_worker_id, str) and raw_intercept_worker_id
             else None
+        )
+        raw_core_identity = raw.get("core_identity")
+        self.core_identity = (
+            raw_core_identity
+            if isinstance(raw_core_identity, str) and raw_core_identity
+            else None
+        )
+        self.core_migration_goal = parse_position(raw.get("core_migration_goal"))
+        raw_goal_kind = raw.get("core_migration_goal_kind")
+        self.core_migration_goal_kind = (
+            raw_goal_kind
+            if raw_goal_kind in {"activity", "density"}
+            else None
+        )
+        last_delta = parse_position(raw.get("core_last_move_delta"))
+        self.core_last_move_delta = (
+            last_delta
+            if last_delta is not None
+            and abs(last_delta[0]) + abs(last_delta[1]) == 1
+            else None
+        )
+        raw_last_move_tick = raw.get("core_last_move_tick", -1)
+        self.core_last_move_tick = (
+            raw_last_move_tick
+            if isinstance(raw_last_move_tick, int)
+            and not isinstance(raw_last_move_tick, bool)
+            else -1
         )
         self.economic_history = []
         raw_economic_history = raw.get("economic_history", [])
@@ -372,6 +404,19 @@ class ScoutMemory:
                         },
                         "core_threat_until_tick": self.core_threat_until_tick,
                         "core_intercept_worker_id": self.core_intercept_worker_id,
+                        "core_identity": self.core_identity,
+                        "core_migration_goal": (
+                            list(self.core_migration_goal)
+                            if self.core_migration_goal is not None
+                            else None
+                        ),
+                        "core_migration_goal_kind": self.core_migration_goal_kind,
+                        "core_last_move_delta": (
+                            list(self.core_last_move_delta)
+                            if self.core_last_move_delta is not None
+                            else None
+                        ),
+                        "core_last_move_tick": self.core_last_move_tick,
                         "economic_history": self.economic_history,
                     }
                 )
@@ -383,6 +428,23 @@ class ScoutMemory:
         self.dirty = False
         if tick is not None:
             self.last_saved_tick = tick
+
+    def sync_core_identity(self, core_id: str) -> None:
+        """Discard migration intent when the server replaces the Core."""
+
+        if self.core_identity == core_id:
+            return
+        replaced = self.core_identity is not None
+        self.core_identity = core_id
+        if not replaced:
+            self.dirty = True
+            return
+        self.core_intercept_worker_id = None
+        self.core_migration_goal = None
+        self.core_migration_goal_kind = None
+        self.core_last_move_delta = None
+        self.core_last_move_tick = -1
+        self.dirty = True
 
     def forget_resource(self, cell: Position) -> None:
         """Discard one stale resource and any Worker assignment to it."""

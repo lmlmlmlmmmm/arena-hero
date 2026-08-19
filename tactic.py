@@ -1223,6 +1223,8 @@ def observe(turn, memory: ScoutMemory) -> Counter:
                     )
         else:
             log.debug("tick=%d event=%s values=%s", turn.tick, event.event_type, event.values)
+        if event.event_type in {"CORE_MOVE_FAILED", "CORE_MOVE_CANCELLED"}:
+            clear_core_move(memory)
         if event.event_type == "CORE_DAMAGED":
             previous_caution = memory.core_threat_until_tick
             memory.core_threat_until_tick = max(
@@ -1449,16 +1451,13 @@ def desired_spawn_order(
     )
     if nearest_distance is not None and nearest_distance <= DEFENDER_SPAWN_DISTANCE:
         preferred = UnitType.VANGUARD if nearest_distance <= 1 else UnitType.RANGER
-        alternate = (
-            UnitType.RANGER if preferred is UnitType.VANGUARD else UnitType.VANGUARD
-        )
-        return (preferred, alternate)
+        return (preferred,)
 
     # The first visible combat Unit is enough warning to establish a defense.
     # Waiting for it to enter the immediate danger radius leaves a small
     # economy too little time to accumulate the cheapest defender's price.
     if (hostile_units or defense_caution) and combat_units == 0:
-        return (UnitType.VANGUARD, UnitType.RANGER)
+        return (UnitType.VANGUARD,)
 
     if workers < MIN_ECONOMY_WORKERS:
         return (UnitType.WORKER,)
@@ -1468,19 +1467,57 @@ def desired_spawn_order(
         target_guards += 1
     if combat_units < target_guards:
         preferred = UnitType.VANGUARD if vanguards <= rangers else UnitType.RANGER
-        alternate = (
-            UnitType.RANGER if preferred is UnitType.VANGUARD else UnitType.VANGUARD
-        )
-        return (preferred, alternate)
+        return (preferred,)
     if workers < MAX_WORKER_POPULATION:
         return (UnitType.WORKER,)
+    # Keep enough ranged coverage even if an older policy already filled the
+    # base-price population band entirely with Vanguards.  There is no Unit
+    # maintenance charge, so correcting that composition above 20 is cheaper
+    # than waiting for a casualty or Core respawn.
+    if rangers < MIN_RANGER_POPULATION:
+        return (UnitType.RANGER,)
     if turn.state.population < BASE_PRICE_POPULATION_LIMIT:
         preferred = UnitType.VANGUARD if vanguards <= rangers else UnitType.RANGER
-        alternate = (
-            UnitType.RANGER if preferred is UnitType.VANGUARD else UnitType.VANGUARD
-        )
-        return (preferred, alternate)
+        return (preferred,)
     return ()
+
+
+def effective_spawn_order(
+    turn,
+    enemies: tuple[CoreView | UnitView, ...],
+    defense_caution: bool,
+    danger: bool,
+    obstacles: frozenset[Position],
+) -> tuple[UnitType, ...]:
+    """Return the production order after applying immediate-threat overrides."""
+
+    spawn_order = desired_spawn_order(turn, enemies, defense_caution)
+    if not danger or turn.core is None:
+        return spawn_order
+    immediate_threats = core_threatening_enemies(
+        turn.core.position,
+        enemies,
+        obstacles,
+    )
+    adjacent_vanguard = any(
+        enemy.unit_type is UnitType.VANGUARD for enemy in immediate_threats
+    )
+    firing_ranger = any(
+        enemy.unit_type is UnitType.RANGER for enemy in immediate_threats
+    )
+    preferred = (
+        UnitType.VANGUARD
+        if adjacent_vanguard
+        else UnitType.RANGER
+        if firing_ranger
+        else spawn_order[0]
+        if spawn_order and spawn_order[0] is not UnitType.WORKER
+        else UnitType.RANGER
+    )
+    alternate = (
+        UnitType.RANGER if preferred is UnitType.VANGUARD else UnitType.VANGUARD
+    )
+    return (preferred, alternate)
 
 
 def defender_reserve_cost(
@@ -1488,23 +1525,34 @@ def defender_reserve_cost(
     enemies: tuple[CoreView | UnitView, ...],
     *,
     defense_caution: bool = False,
+    spawn_order: tuple[UnitType, ...] = (),
 ) -> int:
     """Return the dynamic defender budget that nonessential upkeep must keep."""
 
     if not combat_enemies(enemies) and not defense_caution:
         return 0
+    combat_order = tuple(
+        unit_type for unit_type in spawn_order if unit_type is not UnitType.WORKER
+    )
+    unit_types = combat_order or (UnitType.VANGUARD, UnitType.RANGER)
     return min(
-        unit_cost(UnitType.VANGUARD, turn.state.population),
-        unit_cost(UnitType.RANGER, turn.state.population),
+        unit_cost(unit_type, turn.state.population) for unit_type in unit_types
     )
 
 
-def defender_reserve_target(turn) -> tuple[UnitType, int]:
-    """Return the cheapest dynamically priced combat Unit and its price."""
+def defender_reserve_target(
+    turn,
+    spawn_order: tuple[UnitType, ...] = (),
+) -> tuple[UnitType, int]:
+    """Return the cheapest combat Unit the current production policy accepts."""
 
-    candidates = (
-        (UnitType.VANGUARD, unit_cost(UnitType.VANGUARD, turn.state.population)),
-        (UnitType.RANGER, unit_cost(UnitType.RANGER, turn.state.population)),
+    combat_order = tuple(
+        unit_type for unit_type in spawn_order if unit_type is not UnitType.WORKER
+    )
+    unit_types = combat_order or (UnitType.VANGUARD, UnitType.RANGER)
+    candidates = tuple(
+        (unit_type, unit_cost(unit_type, turn.state.population))
+        for unit_type in unit_types
     )
     return min(candidates, key=lambda candidate: (candidate[1], candidate[0].value))
 
@@ -1517,14 +1565,30 @@ def summarize_defense_decision(
 ) -> str | None:
     """Describe the active defender reserve and the Core decision it produced."""
 
+    if turn.core is None:
+        return None
+    danger = core_in_danger(
+        turn.core.position,
+        enemies,
+        turn.obstacle_cells,
+        DEFENDER_SPAWN_DISTANCE,
+    )
+    spawn_order = effective_spawn_order(
+        turn,
+        enemies,
+        defense_caution,
+        danger,
+        turn.obstacle_cells,
+    )
     reserve = defender_reserve_cost(
         turn,
         enemies,
         defense_caution=defense_caution,
+        spawn_order=spawn_order,
     )
-    if reserve == 0 or turn.core is None:
+    if reserve == 0:
         return None
-    target, price = defender_reserve_target(turn)
+    target, price = defender_reserve_target(turn, spawn_order)
     cell_open = spawn_cell_open(turn)
     action = turn.plan.core_action
     spawned_type = getattr(action, "unit_type", None)
@@ -1544,7 +1608,9 @@ def summarize_defense_decision(
     spawn_blockers: list[str] = []
     if not core_is_stationary(turn):
         spawn_blockers.append("core_moving")
-    if core_budget < price:
+    if not spawn_order:
+        spawn_blockers.append("policy_population_cap")
+    elif core_budget < price:
         spawn_blockers.append(f"funds={price - core_budget}")
     if not cell_open:
         spawn_blockers.append("spawn_cell")
@@ -1563,6 +1629,51 @@ def economic_centroid(points: list[Position]) -> Position | None:
         sum(point[0] for point in points) // len(points),
         sum(point[1] for point in points) // len(points),
     )
+
+
+def clear_core_migration_goal(memory: ScoutMemory) -> None:
+    """Release a completed or obsolete multi-step economic destination."""
+
+    if memory.core_migration_goal is None and memory.core_migration_goal_kind is None:
+        return
+    memory.core_migration_goal = None
+    memory.core_migration_goal_kind = None
+    memory.dirty = True
+
+
+def remember_core_migration_goal(
+    memory: ScoutMemory,
+    goal: Position,
+    kind: str,
+) -> None:
+    """Keep economic movement aimed at one destination across Core steps."""
+
+    if memory.core_migration_goal == goal and memory.core_migration_goal_kind == kind:
+        return
+    memory.core_migration_goal = goal
+    memory.core_migration_goal_kind = kind
+    memory.dirty = True
+
+
+def remember_core_move(memory: ScoutMemory, direction: Direction, tick: int) -> None:
+    """Record the latest economic step so short-lived target noise cannot reverse it."""
+
+    delta = DIRECTION_DELTAS[direction]
+    if memory.core_last_move_delta == delta and memory.core_last_move_tick == tick:
+        return
+    memory.core_last_move_delta = delta
+    memory.core_last_move_tick = tick
+    memory.dirty = True
+
+
+def clear_core_move(memory: ScoutMemory) -> None:
+    """Forget an in-progress direction when migration ends without displacement."""
+
+    if memory.core_last_move_delta is None and memory.core_last_move_tick == -1:
+        return
+    memory.core_last_move_delta = None
+    memory.core_last_move_tick = -1
+    memory.dirty = True
 
 
 def start_economic_core_move(
@@ -1640,6 +1751,7 @@ def start_economic_core_move(
     # routes that may cancel each other around the Core.
     if escaping:
         release_intercept()
+        clear_core_migration_goal(memory)
         goal = (0, 0)
         intents["desert_escaping"] += 1
         intents["density_relocating"] += 1
@@ -1659,21 +1771,57 @@ def start_economic_core_move(
         goal = locked_worker.position
     else:
         release_intercept()
+        remembered_goal = memory.core_migration_goal
+        remembered_kind = memory.core_migration_goal_kind
         current_quota = chunk_resource_quota(core.position)
         economic_goal = economic_centroid(activity_points)
-        if (
-            active_economic_workers >= CORE_RELOCATION_MIN_ACTIVE_WORKERS
+        remembered_goal_is_valid = (
+            remembered_kind == "density"
+            and current_quota < CORE_PREFERRED_RESOURCE_QUOTA
+        ) or (
+            remembered_kind == "activity"
+            and active_economic_workers >= CORE_RELOCATION_MIN_ACTIVE_WORKERS
             and economic_goal is not None
-            and chunk_resource_quota(economic_goal) >= current_quota
+            and remembered_goal is not None
+            and chunk_resource_quota(remembered_goal) >= current_quota
+        )
+        if (
+            remembered_goal is not None
+            and remembered_goal_is_valid
+            and manhattan(core.position, remembered_goal)
+            >= CORE_RELOCATION_MIN_DISTANCE
         ):
-            goal = economic_goal
-        elif current_quota < CORE_PREFERRED_RESOURCE_QUOTA:
-            # Long-lived economic drift otherwise strands the Core in outer
-            # chunks whose refill quota is only a fraction of the central area.
-            goal = (0, 0)
-            intents["density_relocating"] += 1
+            goal = remembered_goal
+            goal_kind = remembered_kind
+            intents["migration_goal_locked"] += 1
+            if goal_kind == "density":
+                intents["density_relocating"] += 1
         else:
-            return hold("no_better_chunk")
+            if remembered_goal is not None:
+                clear_core_migration_goal(memory)
+                reason = (
+                    "goal_reached"
+                    if manhattan(core.position, remembered_goal)
+                    < CORE_RELOCATION_MIN_DISTANCE
+                    else "goal_invalidated"
+                )
+                return hold(reason)
+            if (
+                active_economic_workers >= CORE_RELOCATION_MIN_ACTIVE_WORKERS
+                and economic_goal is not None
+                and chunk_resource_quota(economic_goal) >= current_quota
+            ):
+                goal = economic_goal
+                goal_kind = "activity"
+            elif current_quota < CORE_PREFERRED_RESOURCE_QUOTA:
+                # Long-lived economic drift otherwise strands the Core in outer
+                # chunks whose refill quota is only a fraction of the central area.
+                goal = (0, 0)
+                goal_kind = "density"
+                intents["density_relocating"] += 1
+            else:
+                return hold("no_better_chunk")
+            remember_core_migration_goal(memory, goal, goal_kind)
     if goal is None or manhattan(core.position, goal) < CORE_RELOCATION_MIN_DISTANCE:
         return hold("goal_too_close")
 
@@ -1689,7 +1837,22 @@ def start_economic_core_move(
     step = step_toward(core.position, goal, forbidden | projected_positions)
     if step is None or step in forbidden or step in projected_positions:
         return hold("no_safe_step")
-    core.start_move(direction_between(core.position, step))
+    direction = direction_between(core.position, step)
+    delta = DIRECTION_DELTAS[direction]
+    last_delta = memory.core_last_move_delta
+    reversing = (
+        last_delta is not None
+        and delta == (-last_delta[0], -last_delta[1])
+    )
+    if (
+        reversing
+        and not bootstrap_delivery
+        and not escaping
+        and turn.tick - memory.core_last_move_tick
+        < CORE_MIGRATION_REVERSE_COOLDOWN_TICKS
+    ):
+        return hold("reverse_cooldown")
+    core.start_move(direction)
     memory.last_migration_hold = None
     intents["relocating"] += 1
     if bootstrap_delivery:
@@ -1716,6 +1879,14 @@ def plan_core(
     if core is None:
         return
     if not core_is_stationary(turn):
+        if core.view.move_direction is not None:
+            inferred_start_tick = turn.tick - (core.view.move_progress or 1)
+            if inferred_start_tick > memory.core_last_move_tick:
+                remember_core_move(
+                    memory,
+                    core.view.move_direction,
+                    inferred_start_tick,
+                )
         destination = core.view.destination
         current_risk = projected_core_damage(core.position, enemies, obstacles)
         destination_risk = (
@@ -1763,32 +1934,18 @@ def plan_core(
         intents["core_healing"] += 1
         return
 
-    spawn_order = desired_spawn_order(turn, enemies, defense_caution)
-    if danger:
-        immediate_threats = core_threatening_enemies(core.position, enemies, obstacles)
-        adjacent_vanguard = any(
-            enemy.unit_type is UnitType.VANGUARD for enemy in immediate_threats
-        )
-        firing_ranger = any(
-            enemy.unit_type is UnitType.RANGER for enemy in immediate_threats
-        )
-        preferred = (
-            UnitType.VANGUARD
-            if adjacent_vanguard
-            else UnitType.RANGER
-            if firing_ranger
-            else spawn_order[0]
-            if spawn_order and spawn_order[0] is not UnitType.WORKER
-            else UnitType.RANGER
-        )
-        alternate = (
-            UnitType.RANGER if preferred is UnitType.VANGUARD else UnitType.VANGUARD
-        )
-        spawn_order = (preferred, alternate)
+    spawn_order = effective_spawn_order(
+        turn,
+        enemies,
+        defense_caution,
+        danger,
+        obstacles,
+    )
     defense_reserve = defender_reserve_cost(
         turn,
         enemies,
         defense_caution=defense_caution,
+        spawn_order=spawn_order,
     )
 
     def try_spawn() -> bool:
@@ -2139,13 +2296,28 @@ def unit_heal_reserve(
     danger: bool,
     defense_caution: bool = False,
 ) -> int:
+    reserve_caution = danger or defense_caution
+    spawn_danger = core_in_danger(
+        turn.core.position,
+        turn.visible_enemies,
+        turn.obstacle_cells,
+        DEFENDER_SPAWN_DISTANCE,
+    )
+    spawn_order = effective_spawn_order(
+        turn,
+        turn.visible_enemies,
+        reserve_caution,
+        spawn_danger,
+        turn.obstacle_cells,
+    )
     reserve = max(CORE_HEAL_RESERVE, CORE_HP_FLOOR - turn.core.hp)
     reserve = max(
         reserve,
         defender_reserve_cost(
             turn,
             turn.visible_enemies,
-            defense_caution=danger or defense_caution,
+            defense_caution=reserve_caution,
+            spawn_order=spawn_order,
         ),
     )
     return reserve
@@ -2415,6 +2587,7 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
         for unit in turn.units:
             unit.wait()
         return
+    memory.sync_core_identity(str(turn.core.id))
 
     # Allocate once per living Worker.  Existing assignments survive target
     # rotation and restarts; only newly seen Workers take the least-filled slot.
@@ -2473,10 +2646,24 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
             else turn.resource_space
         ),
     )
+    defense_spawn_danger = core_in_danger(
+        core_position,
+        enemies,
+        obstacles,
+        DEFENDER_SPAWN_DISTANCE,
+    )
+    defense_spawn_order = effective_spawn_order(
+        turn,
+        enemies,
+        defense_caution,
+        defense_spawn_danger,
+        obstacles,
+    )
     defense_reserve = defender_reserve_cost(
         turn,
         enemies,
         defense_caution=defense_caution,
+        spawn_order=defense_spawn_order,
     )
     reservations = MovementReservations(destinations=set(memory.contested))
     if memory.contested:
