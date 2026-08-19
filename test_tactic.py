@@ -448,6 +448,25 @@ def test_defense_telemetry_prices_the_only_policy_approved_defender():
     assert "spawn_blockers:funds=1" in memory.last_defense_status
 
 
+def test_defense_telemetry_reports_worker_first_economy_policy():
+    memory = ScoutMemory()
+    turn = make_turn(
+        resources=15,
+        objects=(
+            core_view(),
+            worker_view((5, 0), uid=2),
+            worker_view((6, 0), uid=3),
+            worker_view((7, 0), uid=4),
+            vanguard_view((2, 0), uid=5),
+            enemy_view((9, 0)),
+        ),
+    )
+    decide(turn, memory)
+    assert memory.last_defense_status is not None
+    assert "spawn_blockers:policy_economy_priority" in memory.last_defense_status
+    assert "policy_population_cap" not in memory.last_defense_status
+
+
 def test_safe_ranger_reserve_outranks_nonessential_shield_repair():
     workers = tuple(worker_view((20 + uid, 0), uid=uid) for uid in range(2, 16))
     vanguards = tuple(vanguard_view((uid, 2), uid=uid) for uid in range(16, 20))

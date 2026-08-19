@@ -1606,10 +1606,15 @@ def summarize_defense_decision(
     else:
         decision = action_name
     spawn_blockers: list[str] = []
+    combat_order = tuple(
+        unit_type for unit_type in spawn_order if unit_type is not UnitType.WORKER
+    )
     if not core_is_stationary(turn):
         spawn_blockers.append("core_moving")
     if not spawn_order:
         spawn_blockers.append("policy_population_cap")
+    elif not combat_order:
+        spawn_blockers.append("policy_economy_priority")
     elif core_budget < price:
         spawn_blockers.append(f"funds={price - core_budget}")
     if not cell_open:
