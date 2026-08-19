@@ -100,6 +100,7 @@ SCOUT_EXHAUSTED_RATIO = 0.8
 SCOUT_FAR_DISTANCE = 72
 SCOUT_TETHER_MARGIN = SCOUT_TETHER_DISTANCE - SCOUT_MAX_DISTANCE
 SCOUT_SAFE_RETURN_DISTANCE = 12
+SCOUT_SECTOR_COUNT = 4
 SCOUT_COVERAGE_TTL = 4096
 SCOUT_COVERAGE_MAX_CELLS = 32768
 SCOUT_HISTORY_LIMIT = 8
@@ -1279,6 +1280,31 @@ def scout_grid_disc(core_position: Position, max_distance: int) -> list[tuple[in
     ]
 
 
+def scout_sector_for_worker(worker_id: str) -> int:
+    """Assign a deterministic cardinal sector to a Worker UUID."""
+
+    try:
+        return UUID(worker_id).bytes[-1] % SCOUT_SECTOR_COUNT
+    except (ValueError, AttributeError):
+        # Test doubles and old persisted state may carry a non-UUID key. Keep
+        # the assignment deterministic instead of making scouting fail closed.
+        return sum(worker_id.encode()) % SCOUT_SECTOR_COUNT
+
+
+def scout_sector(cell: Position, core_position: Position) -> int:
+    """Return the cardinal sector containing a cell around the Core.
+
+    Sectors are ordered East, South, West, North. Ties are assigned to the
+    horizontal axis so every grid cell has exactly one owner sector.
+    """
+
+    dx = cell[0] - core_position[0]
+    dy = cell[1] - core_position[1]
+    if abs(dx) >= abs(dy):
+        return 0 if dx >= 0 else 2
+    return 1 if dy >= 0 else 3
+
+
 def scout_disc_radius(core_position: Position, memory: ScoutMemory) -> int:
     """Return the search radius, widened only once the near disc is explored."""
 
@@ -1303,6 +1329,7 @@ def scout_coverage_target(
     """Select a stable absolute grid target within the current scout disc."""
 
     worker_id = str(worker.id)
+    preferred_sector = scout_sector_for_worker(worker_id)
     existing = memory.scout_targets.get(worker_id)
     if existing is not None and existing not in claimed:
         target = scout_grid_center(existing)
@@ -1314,6 +1341,17 @@ def scout_coverage_target(
                 target,
             )
             memory.scout_targets.pop(worker_id, None)
+            memory.dirty = True
+        elif scout_sector(target, core_position) != preferred_sector:
+            log.info(
+                "tick=%d worker %s moving scout target to sector=%d",
+                tick,
+                worker_id[:8],
+                preferred_sector,
+            )
+            memory.scout_targets.pop(worker_id, None)
+            if memory.is_looping(worker_id):
+                memory.scout_seen[existing] = tick
             memory.dirty = True
         elif (
             memory.scout_seen.get(existing) == tick
@@ -1339,7 +1377,7 @@ def scout_coverage_target(
     center_cell = scout_grid_key(core_position)
     candidate_cells = scout_grid_disc(core_position, max_distance)
 
-    candidates: list[tuple[int, int, int, int, int, int, tuple[int, int]]] = []
+    candidates: list[tuple[int, int, int, int, int, int, int, tuple[int, int]]] = []
     for gx, gy in candidate_cells:
         cell = (gx, gy)
         if cell in claimed:
@@ -1352,9 +1390,13 @@ def scout_coverage_target(
             continue
         last_seen = memory.scout_seen.get(cell, -1)
         age = tick - last_seen if last_seen >= 0 else SCOUT_COVERAGE_TTL
+        sector_penalty = int(
+            scout_sector(target, core_position) != preferred_sector
+        )
         candidates.append(
             (
                 0 if last_seen < 0 else 1,
+                sector_penalty,
                 -age,
                 -chunk_resource_quota(target),
                 distance,
@@ -1365,7 +1407,7 @@ def scout_coverage_target(
         )
     if not candidates:
         return None
-    _, _, _, _, _, _, cell = min(candidates)
+    _, _, _, _, _, _, _, cell = min(candidates)
     memory.scout_targets[worker_id] = cell
     claimed.add(cell)
     memory.dirty = True

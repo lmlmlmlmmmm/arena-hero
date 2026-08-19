@@ -1114,6 +1114,25 @@ def test_scout_grid_targets_are_distinct_for_idle_workers():
     assert memory.scout_targets[str(first.id)] != memory.scout_targets[str(second.id)]
 
 
+def test_scout_grid_targets_prefer_stable_worker_sectors():
+    from tactic import scout_coverage_target, scout_sector, scout_sector_for_worker
+
+    memory = ScoutMemory()
+    claimed: set[tuple[int, int]] = set()
+    workers = tuple(worker_view((0, 0), uid=uid) for uid in range(2, 6))
+    targets = [
+        scout_coverage_target(worker, (0, 0), memory, claimed, 101)
+        for worker in workers
+    ]
+
+    assert all(target is not None for target in targets)
+    assert len(set(targets)) == len(targets)
+    assert all(
+        scout_sector(target, (0, 0)) == scout_sector_for_worker(str(worker.id))
+        for worker, target in zip(workers, targets)
+    )
+
+
 def test_recently_seen_scout_cell_is_not_preferred():
     from tactic import scout_coverage_target
 
