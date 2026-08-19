@@ -1115,11 +1115,16 @@ def test_scout_grid_targets_are_distinct_for_idle_workers():
 
 
 def test_scout_grid_targets_prefer_stable_worker_sectors():
-    from tactic import scout_coverage_target, scout_sector, scout_sector_for_worker
+    from tactic import (
+        ensure_scout_sector_slots,
+        scout_coverage_target,
+        scout_sector,
+    )
 
     memory = ScoutMemory()
     claimed: set[tuple[int, int]] = set()
     workers = tuple(worker_view((0, 0), uid=uid) for uid in range(2, 6))
+    ensure_scout_sector_slots({str(worker.id) for worker in workers}, memory)
     targets = [
         scout_coverage_target(worker, (0, 0), memory, claimed, 101)
         for worker in workers
@@ -1128,9 +1133,39 @@ def test_scout_grid_targets_prefer_stable_worker_sectors():
     assert all(target is not None for target in targets)
     assert len(set(targets)) == len(targets)
     assert all(
-        scout_sector(target, (0, 0)) == scout_sector_for_worker(str(worker.id))
+        scout_sector(target, (0, 0)) == memory.scout_sector_slots[str(worker.id)]
         for worker, target in zip(workers, targets)
     )
+    assert set(memory.scout_sector_slots.values()) == {0, 1, 2, 3}
+
+
+def test_scout_sector_outranks_unseen_cells_in_other_sectors():
+    from tactic import (
+        SCOUT_MAX_DISTANCE,
+        scout_coverage_target,
+        scout_grid_disc,
+        scout_sector,
+        scout_sector_for_worker,
+    )
+
+    worker = worker_view((0, 0), uid=2)
+    preferred = scout_sector_for_worker(str(worker.id))
+    memory = ScoutMemory(
+        scout_sector_slots={str(worker.id): preferred},
+        scout_seen={
+            cell: 100
+            for cell in scout_grid_disc((0, 0), SCOUT_MAX_DISTANCE)
+            if scout_sector(
+                (cell[0] * 3 + 1, cell[1] * 3 + 1),
+                (0, 0),
+            )
+            == preferred
+        }
+    )
+
+    target = scout_coverage_target(worker, (0, 0), memory, set(), 101)
+    assert target is not None
+    assert scout_sector(target, (0, 0)) == preferred
 
 
 def test_recently_seen_scout_cell_is_not_preferred():
@@ -1162,6 +1197,7 @@ def test_scout_coverage_state_survives_restart(tmp_path):
     saved = ScoutMemory(
         scout_seen={(1, -1): 42},
         scout_targets={str(U(2)): (2, 0)},
+        scout_sector_slots={str(U(2)): 3},
         scout_positions={str(U(2)): [(0, 0), (1, 0)]},
         last_move_destinations={str(U(2)): (1, 0)},
         path=path,
@@ -1172,8 +1208,28 @@ def test_scout_coverage_state_survives_restart(tmp_path):
     restored.load()
     assert restored.scout_seen == {(1, -1): 42}
     assert restored.scout_targets == {str(U(2)): (2, 0)}
+    assert restored.scout_sector_slots == {str(U(2)): 3}
     assert restored.scout_positions == {str(U(2)): [(0, 0), (1, 0)]}
     assert restored.last_move_destinations == {str(U(2)): (1, 0)}
+
+
+def test_scout_sector_slots_are_balanced_and_released_after_worker_death():
+    from tactic import ensure_scout_sector_slots
+
+    workers = {str(U(uid)) for uid in range(2, 6)}
+    memory = ScoutMemory()
+    ensure_scout_sector_slots(workers, memory)
+    assert set(memory.scout_sector_slots.values()) == {0, 1, 2, 3}
+
+    survivor = str(U(2))
+    survivor_sector = memory.scout_sector_slots[survivor]
+    memory.prune_workers({survivor})
+    assert memory.scout_sector_slots == {survivor: survivor_sector}
+
+    replacement = str(U(6))
+    ensure_scout_sector_slots({survivor, replacement}, memory)
+    assert memory.scout_sector_slots[survivor] == survivor_sector
+    assert memory.scout_sector_slots[replacement] != survivor_sector
 
 
 def move_destinations(turn):

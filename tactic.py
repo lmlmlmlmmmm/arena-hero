@@ -109,7 +109,7 @@ SCOUT_LOOP_WINDOW = 6
 # oscillation detection alone cannot see it.  Count the idle Ticks separately.
 WORKER_STALL_TICKS = 6
 SCOUT_ABSOLUTE_GRID_SCHEMA = 3
-SCOUT_STATE_SCHEMA = 5
+SCOUT_STATE_SCHEMA = 6
 SCOUT_SAVE_INTERVAL = 8
 # Obstacle terrain is permanent, so it is never expired by age.  It is still
 # bounded, because a long game walks the Core far enough to accumulate terrain
@@ -200,6 +200,10 @@ class ScoutMemory:
     resource_last_seen: dict[Position, int] = field(default_factory=dict)
     scout_seen: dict[tuple[int, int], int] = field(default_factory=dict)
     scout_targets: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # A Worker keeps its assigned cardinal scouting sector across target
+    # rotations and tactic restarts.  New Workers fill the least-populated
+    # sector; existing Workers are never reshuffled.
+    scout_sector_slots: dict[str, int] = field(default_factory=dict)
     scout_positions: dict[str, list[Position]] = field(default_factory=dict)
     position_stalls: dict[str, int] = field(default_factory=dict)
     resource_assignments: dict[str, Position] = field(default_factory=dict)
@@ -374,6 +378,7 @@ class ScoutMemory:
             self.sweeps = {}
             self.scout_seen = {}
             self.scout_targets = {}
+            self.scout_sector_slots = {}
             self.scout_positions = {}
             self.position_stalls = {}
             self.dirty = True
@@ -388,6 +393,13 @@ class ScoutMemory:
             self.sweeps = parse_int_map(raw.get("sweeps", {}))
             self.scout_seen = parse_cell_int_map(raw.get("scout_seen", {}))
             self.scout_targets = parse_position_map(raw.get("scout_targets", {}))
+            self.scout_sector_slots = {
+                worker_id: sector
+                for worker_id, sector in parse_int_map(
+                    raw.get("scout_sector_slots", {})
+                ).items()
+                if 0 <= sector < SCOUT_SECTOR_COUNT
+            }
             self.position_stalls = {
                 worker_id: max(0, count)
                 for worker_id, count in parse_int_map(
@@ -448,6 +460,7 @@ class ScoutMemory:
                             worker_id: list(target)
                             for worker_id, target in self.scout_targets.items()
                         },
+                        "scout_sector_slots": self.scout_sector_slots,
                         "scout_positions": {
                             worker_id: [list(position) for position in positions]
                             for worker_id, positions in self.scout_positions.items()
@@ -549,6 +562,7 @@ class ScoutMemory:
             self.offsets,
             self.sweeps,
             self.scout_targets,
+            self.scout_sector_slots,
             self.scout_positions,
             self.position_stalls,
             self.resource_assignments,
@@ -1280,8 +1294,34 @@ def scout_grid_disc(core_position: Position, max_distance: int) -> list[tuple[in
     ]
 
 
-def scout_sector_for_worker(worker_id: str) -> int:
-    """Assign a deterministic cardinal sector to a Worker UUID."""
+def scout_sector_for_worker(
+    worker_id: str,
+    memory: ScoutMemory | None = None,
+) -> int:
+    """Return a Worker sector, allocating a durable least-filled slot.
+
+    Without a memory object this keeps the original deterministic UUID-based
+    fallback for callers that only need a stable sector in isolation.  The
+    live planner passes ``ScoutMemory`` so assignments are balanced once and
+    then retained across target rotations and restarts.
+    """
+
+    if memory is not None:
+        existing = memory.scout_sector_slots.get(worker_id)
+        if existing is not None and 0 <= existing < SCOUT_SECTOR_COUNT:
+            return existing
+        counts = Counter(
+            sector
+            for sector in memory.scout_sector_slots.values()
+            if 0 <= sector < SCOUT_SECTOR_COUNT
+        )
+        sector = min(
+            range(SCOUT_SECTOR_COUNT),
+            key=lambda candidate: (counts[candidate], candidate),
+        )
+        memory.scout_sector_slots[worker_id] = sector
+        memory.dirty = True
+        return sector
 
     try:
         return UUID(worker_id).bytes[-1] % SCOUT_SECTOR_COUNT
@@ -1289,6 +1329,17 @@ def scout_sector_for_worker(worker_id: str) -> int:
         # Test doubles and old persisted state may carry a non-UUID key. Keep
         # the assignment deterministic instead of making scouting fail closed.
         return sum(worker_id.encode()) % SCOUT_SECTOR_COUNT
+
+
+def ensure_scout_sector_slots(
+    worker_ids: set[str] | list[str] | tuple[str, ...],
+    memory: ScoutMemory,
+) -> None:
+    """Allocate balanced sectors for every currently living Worker."""
+
+    living = set(worker_ids)
+    for worker_id in sorted(living):
+        scout_sector_for_worker(worker_id, memory)
 
 
 def scout_sector(cell: Position, core_position: Position) -> int:
@@ -1329,7 +1380,7 @@ def scout_coverage_target(
     """Select a stable absolute grid target within the current scout disc."""
 
     worker_id = str(worker.id)
-    preferred_sector = scout_sector_for_worker(worker_id)
+    preferred_sector = scout_sector_for_worker(worker_id, memory)
     existing = memory.scout_targets.get(worker_id)
     if existing is not None and existing not in claimed:
         target = scout_grid_center(existing)
@@ -1395,8 +1446,8 @@ def scout_coverage_target(
         )
         candidates.append(
             (
-                0 if last_seen < 0 else 1,
                 sector_penalty,
+                0 if last_seen < 0 else 1,
                 -age,
                 -chunk_resource_quota(target),
                 distance,
@@ -3011,6 +3062,10 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
         for unit in turn.units:
             unit.wait()
         return
+
+    # Allocate once per living Worker.  Existing assignments survive target
+    # rotation and restarts; only newly seen Workers take the least-filled slot.
+    ensure_scout_sector_slots({str(worker.id) for worker in turn.workers}, memory)
 
     enemies = turn.visible_enemies
     enemy_cells = {enemy.position for enemy in enemies}
