@@ -2402,6 +2402,25 @@ def test_lone_guard_holds_when_only_enemy_is_far_from_core():
     assert memory.last_intents["engaging"] == 0
 
 
+def test_vanguard_sweeps_adjacent_enemy_even_when_far_from_core():
+    """Local contact takes priority over the first-unit guard assignment."""
+
+    memory = ScoutMemory()
+    turn = make_turn(
+        resources=0,
+        objects=(
+            core_view(),
+            vanguard_view((20, 0), uid=4),
+            enemy_view((21, 0), uid=90),
+        ),
+    )
+    decide(turn, memory)
+    assert action_type(turn.plan, 4) == "SweepAction"
+    assert direction_of(turn.plan, 4) is Direction.RIGHT
+    assert memory.last_intents["engaging"] == 1
+    assert memory.last_intents["guarding"] == 0
+
+
 # --- bounded scouting and reachable-resource scheduling ----------------------
 
 
