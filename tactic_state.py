@@ -83,6 +83,7 @@ class ScoutMemory:
     # rotations and tactic restarts.  New Workers fill the least-populated
     # sector; existing Workers are never reshuffled.
     scout_sector_slots: dict[str, int] = field(default_factory=dict)
+    scout_roles: dict[str, str] = field(default_factory=dict)
     scout_positions: dict[str, list[Position]] = field(default_factory=dict)
     position_stalls: dict[str, int] = field(default_factory=dict)
     resource_assignments: dict[str, Position] = field(default_factory=dict)
@@ -96,6 +97,7 @@ class ScoutMemory:
     last_events: Counter = field(default_factory=Counter)
     last_intents: Counter = field(default_factory=Counter)
     last_resource_flow: Counter = field(default_factory=Counter)
+    last_combat_results: Counter = field(default_factory=Counter)
     economic_history: list[tuple[int, int, int, int]] = field(default_factory=list)
     last_trip_budget: int = RESOURCE_TRIP_COST_NORMAL
     core_threat_until_tick: int = 0
@@ -290,6 +292,7 @@ class ScoutMemory:
             self.scout_seen = {}
             self.scout_targets = {}
             self.scout_sector_slots = {}
+            self.scout_roles = {}
             self.scout_positions = {}
             self.position_stalls = {}
             self.dirty = True
@@ -311,6 +314,16 @@ class ScoutMemory:
                 ).items()
                 if 0 <= sector < SCOUT_SECTOR_COUNT
             }
+            raw_scout_roles = raw.get("scout_roles", {})
+            self.scout_roles = (
+                {
+                    str(worker_id): role
+                    for worker_id, role in raw_scout_roles.items()
+                    if role in {"local", "remote"}
+                }
+                if isinstance(raw_scout_roles, dict)
+                else {}
+            )
             self.position_stalls = {
                 worker_id: max(0, count)
                 for worker_id, count in parse_int_map(
@@ -372,6 +385,7 @@ class ScoutMemory:
                             for worker_id, target in self.scout_targets.items()
                         },
                         "scout_sector_slots": self.scout_sector_slots,
+                        "scout_roles": self.scout_roles,
                         "scout_positions": {
                             worker_id: [list(position) for position in positions]
                             for worker_id, positions in self.scout_positions.items()
@@ -504,6 +518,7 @@ class ScoutMemory:
             self.sweeps,
             self.scout_targets,
             self.scout_sector_slots,
+            self.scout_roles,
             self.scout_positions,
             self.position_stalls,
             self.resource_assignments,

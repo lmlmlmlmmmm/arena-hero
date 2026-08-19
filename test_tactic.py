@@ -1325,6 +1325,7 @@ def test_scout_coverage_state_survives_restart(tmp_path):
         scout_seen={(1, -1): 42},
         scout_targets={str(U(2)): (2, 0)},
         scout_sector_slots={str(U(2)): 3},
+        scout_roles={str(U(2)): "remote"},
         scout_positions={str(U(2)): [(0, 0), (1, 0)]},
         last_move_destinations={str(U(2)): (1, 0)},
         path=path,
@@ -1336,6 +1337,7 @@ def test_scout_coverage_state_survives_restart(tmp_path):
     assert restored.scout_seen == {(1, -1): 42}
     assert restored.scout_targets == {str(U(2)): (2, 0)}
     assert restored.scout_sector_slots == {str(U(2)): 3}
+    assert restored.scout_roles == {str(U(2)): "remote"}
     assert restored.scout_positions == {str(U(2)): [(0, 0), (1, 0)]}
     assert restored.last_move_destinations == {str(U(2)): (1, 0)}
 
@@ -1357,6 +1359,56 @@ def test_scout_sector_slots_are_balanced_and_released_after_worker_death():
     ensure_scout_sector_slots({survivor, replacement}, memory)
     assert memory.scout_sector_slots[survivor] == survivor_sector
     assert memory.scout_sector_slots[replacement] != survivor_sector
+
+
+def test_scout_roles_split_workers_deterministically_between_local_and_remote():
+    from tactic import ensure_scout_roles
+
+    worker_ids = {str(U(uid)) for uid in range(2, 16)}
+    first = ScoutMemory()
+    second = ScoutMemory()
+    ensure_scout_roles(worker_ids, first)
+    ensure_scout_roles(reversed(sorted(worker_ids)), second)
+
+    assert first.scout_roles == second.scout_roles
+    assert Counter(first.scout_roles.values()) == Counter(local=8, remote=6)
+
+
+def test_scout_roles_have_separate_local_and_remote_target_discs():
+    from tactic import ensure_scout_roles, scout_coverage_target, scout_radius_for_worker
+
+    turn = make_turn(
+        objects=(
+            core_view(),
+            *(worker_view((0, uid), uid=uid) for uid in range(2, 16)),
+        ),
+        tick=100,
+    )
+    memory = ScoutMemory()
+    ensure_scout_roles({str(worker.id) for worker in turn.workers}, memory)
+    claimed = set()
+    distances = {}
+    for worker in turn.workers:
+        worker_id = str(worker.id)
+        radius = scout_radius_for_worker(worker_id, memory)
+        target = scout_coverage_target(
+            worker,
+            (0, 0),
+            memory,
+            claimed,
+            turn.tick,
+            max_distance=radius,
+            min_distance=41 if memory.scout_roles[worker_id] == "remote" else 0,
+        )
+        assert target is not None
+        distances[memory.scout_roles[worker_id], worker_id] = sum(map(abs, target))
+
+    assert max(
+        distance for (role, _), distance in distances.items() if role == "local"
+    ) <= 40
+    assert min(
+        distance for (role, _), distance in distances.items() if role == "remote"
+    ) > 40
 
 
 def move_destinations(turn):
@@ -2217,7 +2269,9 @@ def test_queued_core_move_does_not_start_reverse_cooldown_before_resolution():
 def test_failed_or_cancelled_core_move_clears_reverse_cooldown():
     from tactic import observe
 
-    for index, event_type in enumerate(("CORE_MOVE_FAILED", "CORE_MOVE_CANCELLED")):
+    for index, event_type in enumerate(
+        ("CORE_MOVE_START_FAILED", "CORE_MOVE_FAILED", "CORE_MOVE_CANCELLED")
+    ):
         event = ResolutionEvent(
             event_id=U(80 + index),
             tick=104,
@@ -2452,6 +2506,51 @@ def test_remote_low_quota_core_relocates_toward_richer_chunks():
     assert core_action_type(turn) == "StartMoveAction"
     assert turn.plan.core_action.direction is Direction.RIGHT
     assert memory.last_intents["density_relocating"] == 1
+    assert memory.core_migration_goal == (-768, 0)
+    assert memory.core_migration_goal_kind == "density"
+
+
+def test_density_migration_milestone_is_bounded_to_one_chunk():
+    from tactic import core_migration_milestone
+
+    assert core_migration_milestone((-800, 0), (0, 0)) == (-768, 0)
+    assert core_migration_milestone((-10, -10), (0, 0)) == (0, 0)
+    assert core_migration_milestone((-20, -20), (20, 20)) == (12, -20)
+
+
+def test_legacy_long_density_goal_is_trimmed_before_migration_resumes():
+    memory = ScoutMemory(
+        core_migration_goal=(0, 0),
+        core_migration_goal_kind="density",
+    )
+    turn = make_turn(
+        resources=0,
+        objects=(
+            core_view(position=(-800, 0)),
+            *(worker_view((-790, uid), uid=uid) for uid in range(2, 6)),
+        ),
+    )
+    decide(turn, memory)
+    assert memory.core_migration_goal == (-768, 0)
+    assert core_action_type(turn) == "StartMoveAction"
+
+
+def test_reaching_density_milestone_forces_a_fresh_economic_evaluation():
+    memory = ScoutMemory(
+        core_migration_goal=(-768, 0),
+        core_migration_goal_kind="density",
+    )
+    turn = make_turn(
+        resources=0,
+        objects=(
+            core_view(position=(-775, 0)),
+            *(worker_view((-765, uid), uid=uid) for uid in range(2, 6)),
+        ),
+    )
+    decide(turn, memory)
+    assert memory.core_migration_goal is None
+    assert memory.last_migration_hold == "goal_reached"
+    assert core_action_type(turn) == "WaitAction"
 
 
 def test_recent_core_damage_pauses_economic_migration():
@@ -2750,6 +2849,71 @@ def test_vanguard_sweeps_adjacent_enemy_even_when_far_from_core():
     assert memory.last_intents["guarding"] == 0
 
 
+def test_distant_ordinary_enemy_does_not_draw_the_combat_fleet():
+    memory = ScoutMemory()
+    defenders = tuple(
+        vanguard_view((0, index + 2), uid=uid)
+        for index, uid in enumerate(range(10, 17))
+    )
+    turn = make_turn(
+        resources=0,
+        objects=(core_view(), worker_view((2, 0), uid=2), *defenders, enemy_view((60, 0))),
+    )
+    decide(turn, memory)
+    assert memory.last_intents["engaging"] == 0
+    assert memory.last_intents["limited_pursuit"] == 0
+
+
+def test_ordinary_enemy_inside_the_leash_draws_only_two_hunters():
+    memory = ScoutMemory()
+    defenders = tuple(
+        vanguard_view((0, index + 2), uid=uid)
+        for index, uid in enumerate(range(10, 17))
+    )
+    turn = make_turn(
+        resources=0,
+        objects=(core_view(), worker_view((2, 0), uid=2), *defenders, enemy_view((12, 0))),
+    )
+    decide(turn, memory)
+    assert memory.last_intents["engaging"] == 2
+    assert memory.last_intents["limited_pursuit"] == 2
+
+
+def test_immediate_core_threat_draws_the_full_combat_fleet():
+    memory = ScoutMemory()
+    defenders = tuple(
+        vanguard_view((0, index + 2), uid=uid)
+        for index, uid in enumerate(range(10, 17))
+    )
+    turn = make_turn(
+        resources=0,
+        objects=(core_view(), worker_view((2, 0), uid=2), *defenders, enemy_view((1, 0))),
+    )
+    decide(turn, memory)
+    assert memory.last_intents["engaging"] == len(defenders)
+
+
+def test_distant_beacon_carrier_draws_only_two_hunters():
+    memory = ScoutMemory()
+    defenders = tuple(
+        ranger_view((0, index + 2), uid=uid)
+        for index, uid in enumerate(range(10, 17))
+    )
+    carrier = enemy_view((60, 0), uid=90)
+    turn = make_turn(
+        resources=0,
+        objects=(core_view(), worker_view((2, 0), uid=2), *defenders, carrier),
+        beacon=ChampionBeacon(
+            position=carrier.position,
+            status=BeaconStatus.CARRIED,
+            carrier_id=carrier.id,
+        ),
+    )
+    decide(turn, memory)
+    assert memory.last_intents["engaging"] == 2
+    assert memory.last_intents["carrier_hunting"] == 2
+
+
 # --- bounded scouting and reachable-resource scheduling ----------------------
 
 
@@ -2945,6 +3109,24 @@ def test_exhausted_scout_disc_sends_a_worker_past_the_near_radius():
     )
     assert target is not None
     assert abs(target[0]) + abs(target[1]) > SCOUT_MAX_DISTANCE
+
+
+def test_visible_resource_assignment_overrides_a_remote_scout_role():
+    from tactic import ensure_scout_roles
+
+    workers = tuple(worker_view((uid, 0), uid=uid) for uid in range(2, 16))
+    memory = ScoutMemory()
+    ensure_scout_roles({str(worker.id) for worker in workers}, memory)
+    remote_id = min(
+        worker_id for worker_id, role in memory.scout_roles.items() if role == "remote"
+    )
+    remote_worker = next(worker for worker in workers if str(worker.id) == remote_id)
+    turn = make_turn(
+        resources=0,
+        objects=(core_view(), *workers, terrain("RESOURCE", [remote_worker.position])),
+    )
+    decide(turn, memory)
+    assert action_type(turn.plan, int(remote_id[-2:], 16)) == "HarvestAction"
 
 
 def test_distant_visible_resource_under_worker_is_harvested_immediately():
@@ -3485,6 +3667,64 @@ def test_resource_event_amounts_are_aggregated_for_tick_logs():
     turn = make_turn(objects=(core_view(), worker_view((3, 0), uid=2)), events=events)
     decide(turn, memory)
     assert memory.last_resource_flow == Counter(harvest=2, deposit=1, dropped=2)
+
+
+def test_combat_events_are_aggregated_into_effectiveness_telemetry():
+    from tactic import summarize_combat
+
+    events = (
+        ResolutionEvent(
+            event_id=U(73),
+            tick=99,
+            event_type="SWEEP_RESOLVED",
+            values={"targets_hit": 3},
+        ),
+        ResolutionEvent(
+            event_id=U(74),
+            tick=99,
+            event_type="SHOT_HIT",
+            values={"damage": 1},
+        ),
+        ResolutionEvent(
+            event_id=U(75),
+            tick=99,
+            event_type="SHOT_MISSED",
+            reason_code="SHOT_MISSED",
+        ),
+        ResolutionEvent(
+            event_id=U(76),
+            tick=99,
+            event_type="DESTRUCTION_PARTICIPATION",
+            reason_code="UNIT",
+        ),
+    )
+    memory = ScoutMemory()
+    turn = make_turn(objects=(core_view(), worker_view((3, 0), uid=2)), events=events)
+    decide(turn, memory)
+    assert memory.last_combat_results == Counter(
+        sweeps=1,
+        sweep_targets=3,
+        ranger_hits=1,
+        ranger_damage=1,
+        ranger_misses=1,
+        destructions=1,
+    )
+    assert summarize_combat(memory.last_combat_results) == (
+        "combat[sweeps:1,targets:3,shots:1/1,damage:1,destructions:1]"
+    )
+
+
+def test_migration_telemetry_reports_ring_quota_and_goal_distance():
+    from tactic import summarize_migration
+
+    memory = ScoutMemory(
+        core_migration_goal=(-768, 0),
+        core_migration_goal_kind="density",
+    )
+    turn = make_turn(objects=(core_view(position=(-800, 0)), worker_view((-799, 0))))
+    assert summarize_migration(turn, memory) == (
+        "migration[ring:24,quota:4,kind:density,goal:(-768, 0),distance:32]"
+    )
 
 
 # --- P1: bounded terrain memory, durable cooldowns, honest deposit ETA -------

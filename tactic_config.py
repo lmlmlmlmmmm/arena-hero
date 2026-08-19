@@ -70,6 +70,11 @@ SCOUT_FAR_DISTANCE = 72
 SCOUT_TETHER_MARGIN = SCOUT_TETHER_DISTANCE - SCOUT_MAX_DISTANCE
 SCOUT_SAFE_RETURN_DISTANCE = 12
 SCOUT_SECTOR_COUNT = 4
+# Keep most Workers close enough to refresh nearby resource visibility while a
+# smaller stable group searches beyond the local disc.  At the 14-Worker cap
+# this assigns 8 local and 6 remote roles.
+SCOUT_REMOTE_ROLE_NUMERATOR = 3
+SCOUT_REMOTE_ROLE_DENOMINATOR = 7
 SCOUT_COVERAGE_TTL = 4096
 SCOUT_COVERAGE_MAX_CELLS = 32768
 SCOUT_HISTORY_LIMIT = 8
@@ -78,7 +83,7 @@ SCOUT_LOOP_WINDOW = 6
 # oscillation detection alone cannot see it. Count the idle Ticks separately.
 WORKER_STALL_TICKS = 6
 SCOUT_ABSOLUTE_GRID_SCHEMA = 3
-SCOUT_STATE_SCHEMA = 7
+SCOUT_STATE_SCHEMA = 8
 SCOUT_SAVE_INTERVAL = 8
 # Obstacle terrain is permanent, so it is never expired by age. It is still
 # bounded, because a long game walks the Core far enough to accumulate terrain
@@ -125,6 +130,7 @@ CORE_DEFENSE_ALERT_DISTANCE = 8
 CORE_SHIELD_EMERGENCY_FLOOR = 2
 CORE_THREAT_CAUTION_TICKS = 6
 CORE_PREFERRED_RESOURCE_QUOTA = 6
+CORE_DENSITY_MILESTONE_DISTANCE = 32
 # A Worker has two hit points and sees three cells, so it can neither win nor
 # outrun a fight it has already walked into. Leave before contact, not after.
 WORKER_FLEE_DISTANCE = 4
@@ -143,6 +149,12 @@ PATROL_OFFSETS = SCOUT_OFFSETS
 PATROL_ROTATION_TICKS = 8
 RANGER_PATROL_RADIUS = 8
 VANGUARD_PATROL_RADIUS = 5
+
+# General pursuit is intentionally smaller than the scouting disc.  Immediate
+# Core threats still receive the whole defense force, while ordinary visible
+# targets can draw only a pair of hunters and cannot lure them arbitrarily far.
+COMBAT_PURSUIT_DISTANCE = 16
+COMBAT_PURSUIT_HUNTERS = 2
 
 # Event types carrying one of these markers mean the server rejected or failed
 # something we asked for, which is always worth surfacing in the log.

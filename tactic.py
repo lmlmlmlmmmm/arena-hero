@@ -15,7 +15,6 @@ import os
 import sys
 import time
 from collections import Counter
-from heapq import heappop, heappush
 from pathlib import Path
 from uuid import UUID
 
@@ -39,6 +38,27 @@ from arena_hero import (
 # Policy constants live in a dependency-leaf module. Re-exporting them here
 # keeps the historical ``tactic.CONSTANT`` API intact.
 from tactic_config import *  # noqa: F401,F403
+from tactic_pathing import (
+    bounded_route_cost,
+    direction_between,
+    manhattan,
+    move_or_escape,
+    move_or_wait,
+    nearest_target,
+    step_toward,
+)
+from tactic_combat import (
+    combat_enemies,
+    core_in_danger,
+    core_threatening_enemies,
+    is_legal_shot,
+    needs_planned_damage,
+    plan_ranger,
+    plan_vanguard,
+    projected_core_damage,
+    target_durability,
+    threat_order,
+)
 from tactic_state import (
     MovementReservations,
     ResourceProgress,
@@ -47,138 +67,6 @@ from tactic_state import (
 )
 
 log = logging.getLogger("arena-hero-tactic")
-
-
-def manhattan(a: Position, b: Position) -> int:
-    return abs(a[0] - b[0]) + abs(a[1] - b[1])
-
-
-def direction_between(a: Position, b: Position) -> Direction:
-    if b[1] < a[1]:
-        return Direction.UP
-    if b[1] > a[1]:
-        return Direction.DOWN
-    if b[0] < a[0]:
-        return Direction.LEFT
-    return Direction.RIGHT
-
-
-def _monotonic_route_clear(
-    start: Position,
-    goal: Position,
-    blocked: set[Position] | frozenset[Position],
-    reserved: set[Position] | frozenset[Position],
-    first_axis: int,
-) -> bool:
-    """Check one x-then-y or y-then-x route without allocating a path."""
-
-    x, y = start
-    axes = (0, 1) if first_axis == 0 else (1, 0)
-    for axis in axes:
-        target = goal[axis]
-        while (x, y)[axis] != target:
-            dx = 1 if goal[0] > x else -1 if goal[0] < x else 0
-            dy = 1 if goal[1] > y else -1 if goal[1] < y else 0
-            if axis == 0:
-                x += dx
-            else:
-                y += dy
-            cell = (x, y)
-            if cell in reserved:
-                return False
-            if cell != goal and cell in blocked:
-                return False
-    return True
-
-
-def bounded_route_cost(
-    start: Position,
-    goal: Position,
-    blocked: set[Position] | frozenset[Position],
-) -> int | None:
-    """Estimate a route length, returning None for a costly or unknown route."""
-
-    direct = manhattan(start, goal)
-    if direct == 0:
-        return 0
-    if _monotonic_route_clear(start, goal, blocked, frozenset(), 0):
-        return direct
-    if _monotonic_route_clear(start, goal, blocked, frozenset(), 1):
-        return direct
-
-    frontier: list[tuple[int, int, Position]] = [(direct, 0, start)]
-    best_cost = {start: 0}
-    budget = ROUTE_ESTIMATE_BUDGET
-    while frontier and budget > 0:
-        budget -= 1
-        _, cost, current = heappop(frontier)
-        if cost != best_cost.get(current):
-            continue
-        if current == goal:
-            return cost
-        for direction in DIRECTION_ORDER:
-            dx, dy = DIRECTION_DELTAS[direction]
-            nxt = (current[0] + dx, current[1] + dy)
-            if nxt != goal and nxt in blocked:
-                continue
-            next_cost = cost + 1
-            estimate = next_cost + manhattan(nxt, goal)
-            if next_cost >= best_cost.get(nxt, float("inf")):
-                continue
-            best_cost[nxt] = next_cost
-            heappush(frontier, (estimate, next_cost, nxt))
-    # A known wall can make exact A* expensive even though the infinite map is
-    # still navigable.  Preserve the best admissible frontier estimate so a
-    # Worker is not sent scouting merely because the estimator hit its budget.
-    if frontier:
-        return min(estimate for estimate, _, _ in frontier)
-    return None
-
-
-def is_legal_shot(origin: Position, cell: Position, obstacles: frozenset[Position]) -> bool:
-    dx = cell[0] - origin[0]
-    dy = cell[1] - origin[1]
-    if dx == 0 and dy == 0:
-        return False
-    if dx != 0 and dy != 0 and abs(dx) != abs(dy):
-        return False
-    distance = max(abs(dx), abs(dy))
-    if not 1 <= distance <= 3:
-        return False
-    step_x = 1 if dx > 0 else (-1 if dx < 0 else 0)
-    step_y = 1 if dy > 0 else (-1 if dy < 0 else 0)
-    for i in range(1, distance):
-        if (origin[0] + i * step_x, origin[1] + i * step_y) in obstacles:
-            return False
-    return True
-
-
-def combat_enemies(
-    enemies: tuple[CoreView | UnitView, ...],
-) -> tuple[UnitView, ...]:
-    """Return visible enemies that can actually damage the Core or Units."""
-
-    return tuple(
-        enemy
-        for enemy in enemies
-        if getattr(enemy, "unit_type", None) in {UnitType.VANGUARD, UnitType.RANGER}
-    )
-
-
-def projected_core_damage(
-    core_position: Position,
-    enemies: tuple[CoreView | UnitView, ...],
-    obstacles: frozenset[Position],
-) -> int:
-    """Count attacks visible enemies can legally land on the Core this Tick."""
-
-    damage = 0
-    for enemy in combat_enemies(enemies):
-        if enemy.unit_type is UnitType.VANGUARD:
-            damage += int(manhattan(enemy.position, core_position) == 1)
-        elif is_legal_shot(enemy.position, core_position, obstacles):
-            damage += 1
-    return damage
 
 
 def projected_post_combat_capacity(
@@ -246,42 +134,6 @@ def projected_post_combat_capacity(
         possible_losses += 1
     population = max(0, turn.state.population - possible_losses)
     return core_resource_capacity(population)
-
-
-def core_threatening_enemies(
-    core_position: Position,
-    enemies: tuple[CoreView | UnitView, ...],
-    obstacles: frozenset[Position],
-) -> tuple[UnitView, ...]:
-    """Return enemies able to damage the Core from their current cells."""
-
-    return tuple(
-        enemy
-        for enemy in combat_enemies(enemies)
-        if (
-            enemy.unit_type is UnitType.VANGUARD
-            and manhattan(enemy.position, core_position) == 1
-        )
-        or (
-            enemy.unit_type is UnitType.RANGER
-            and is_legal_shot(enemy.position, core_position, obstacles)
-        )
-    )
-
-
-def core_in_danger(
-    core_position: Position,
-    enemies: tuple[CoreView | UnitView, ...],
-    obstacles: frozenset[Position],
-    distance: int,
-) -> bool:
-    """Return whether the Core is under legal fire or near a combat Unit."""
-
-    hostile_units = combat_enemies(enemies)
-    return bool(core_threatening_enemies(core_position, enemies, obstacles)) or any(
-        manhattan(core_position, enemy.position) <= distance
-        for enemy in hostile_units
-    )
 
 
 def player_holds_beacon(turn) -> bool:
@@ -360,146 +212,6 @@ def remember_threat_cells(
     for cell in enemy_threat_cells(turn.visible_enemies, obstacles):
         memory.threatened[cell] = turn.tick + THREAT_MEMORY_TICKS
     return set(memory.threatened)
-
-
-def step_toward(
-    start: Position,
-    goal: Position,
-    blocked: set[Position],
-    reserved: set[Position] = frozenset(),
-) -> Position | None:
-    """Return the first deterministic pathfinding step toward goal.
-
-    Open-map scout routes use a cheap Manhattan fast path, which stays O(distance)
-    and works for arbitrarily distant waypoints. A* is reserved for routes that
-    need to navigate around known blocked cells.
-    """
-
-    if start == goal:
-        return None
-    if goal in reserved:
-        return None
-
-    if _monotonic_route_clear(start, goal, blocked, reserved, 0):
-        dx = 1 if goal[0] > start[0] else -1 if goal[0] < start[0] else 0
-        if dx:
-            return (start[0] + dx, start[1])
-        dy = 1 if goal[1] > start[1] else -1
-        return (start[0], start[1] + dy)
-    if _monotonic_route_clear(start, goal, blocked, reserved, 1):
-        dy = 1 if goal[1] > start[1] else -1 if goal[1] < start[1] else 0
-        if dy:
-            return (start[0], start[1] + dy)
-        dx = 1 if goal[0] > start[0] else -1
-        return (start[0] + dx, start[1])
-
-    # f-score, remaining distance, g-score, discovery order, cell, first step
-    frontier: list[tuple[int, int, int, int, Position, Position | None]] = []
-    heappush(frontier, (manhattan(start, goal), manhattan(start, goal), 0, 0, start, None))
-    best_cost = {start: 0}
-    discovery_order = 0
-    budget = PATHFIND_BUDGET
-    while frontier and budget > 0:
-        budget -= 1
-        _, _, cost, _, current, first_step = heappop(frontier)
-        if cost != best_cost.get(current):
-            continue
-        if current == goal:
-            return first_step
-        for direction in DIRECTION_ORDER:
-            dx, dy = DIRECTION_DELTAS[direction]
-            nxt = (current[0] + dx, current[1] + dy)
-            if nxt in reserved:
-                continue
-            if nxt != goal and nxt in blocked:
-                continue
-            next_cost = cost + 1
-            if next_cost >= best_cost.get(nxt, float("inf")):
-                continue
-            best_cost[nxt] = next_cost
-            discovery_order += 1
-            heappush(
-                frontier,
-                (
-                    next_cost + manhattan(nxt, goal),
-                    manhattan(nxt, goal),
-                    next_cost,
-                    discovery_order,
-                    nxt,
-                    first_step if first_step is not None else nxt,
-                ),
-            )
-    if frontier:
-        # A distant route around known walls may exceed one Tick's search
-        # budget.  Follow the best partial route and replan from fresh state on
-        # the next Tick instead of waiting forever for a complete path.
-        _, _, _, _, _, first_step = min(
-            frontier,
-            key=lambda item: (item[1], item[2], item[3]),
-        )
-        return first_step
-    return None
-
-
-def move_or_wait(
-    unit,
-    goal: Position,
-    blocked: set[Position],
-    reservations: MovementReservations | None = None,
-) -> bool:
-    """Queue a non-conflicting step toward goal, or wait when none exists."""
-
-    reserved = reservations.destinations if reservations is not None else frozenset()
-    step = step_toward(unit.position, goal, blocked, reserved)
-    if step is None:
-        unit.wait()
-        return False
-    unit.move(direction_between(unit.position, step))
-    if reservations is not None:
-        reservations.reserve(unit.id, step)
-    return True
-
-
-def move_or_escape(
-    unit,
-    goal: Position,
-    blocked: set[Position],
-    hard_blocked: set[Position],
-    reservations: MovementReservations | None = None,
-) -> bool:
-    """Prefer a safe route, but never freeze cargo inside a visible threat."""
-
-    reserved = reservations.destinations if reservations is not None else frozenset()
-    step = step_toward(unit.position, goal, blocked, reserved)
-    if step is None and unit.position in blocked and unit.position not in hard_blocked:
-        candidates: list[tuple[int, int, int, Position]] = []
-        for order, direction in enumerate(DIRECTION_ORDER):
-            dx, dy = DIRECTION_DELTAS[direction]
-            candidate = (unit.position[0] + dx, unit.position[1] + dy)
-            if candidate in hard_blocked or candidate in reserved:
-                continue
-            candidates.append(
-                (
-                    1 if candidate in blocked else 0,
-                    manhattan(candidate, goal),
-                    order,
-                    candidate,
-                )
-            )
-        if candidates:
-            *_, step = min(candidates)
-    if step is None:
-        unit.wait()
-        return False
-    unit.move(direction_between(unit.position, step))
-    if reservations is not None:
-        reservations.reserve(unit.id, step)
-    return True
-
-
-def nearest_target(origin: Position, targets: set[Position]) -> Position | None:
-    ordered = sorted(targets, key=lambda cell: (manhattan(origin, cell), cell[0], cell[1]))
-    return ordered[0] if ordered else None
 
 
 def _line_cells(start: Position, end: Position) -> tuple[Position, ...]:
@@ -610,6 +322,17 @@ def chunk_resource_quota(position: Position) -> int:
     return max(2, (16 * 8) // (8 + ring))
 
 
+def chunk_ring(position: Position) -> int:
+    """Return the documented density ring for a world position."""
+
+    chunk_x, chunk_y = position[0] // 32, position[1] // 32
+
+    def axis(value: int) -> int:
+        return value if value >= 0 else -value - 1
+
+    return axis(chunk_x) + axis(chunk_y)
+
+
 def mark_scout_coverage(turn, memory: ScoutMemory) -> None:
     """Mark coarse cells currently covered by the Core and controlled Units."""
 
@@ -695,6 +418,78 @@ def ensure_scout_sector_slots(
         scout_sector_for_worker(worker_id, memory)
 
 
+def remote_scout_role_count(worker_count: int) -> int:
+    """Return the bounded remote share for the current Worker fleet."""
+
+    return (
+        max(0, worker_count) * SCOUT_REMOTE_ROLE_NUMERATOR
+        // SCOUT_REMOTE_ROLE_DENOMINATOR
+    )
+
+
+def ensure_scout_roles(
+    worker_ids: set[str] | list[str] | tuple[str, ...],
+    memory: ScoutMemory,
+) -> None:
+    """Keep a deterministic local/remote split across rotations and restarts."""
+
+    living = set(worker_ids)
+    ensure_scout_sector_slots(living, memory)
+    changed = False
+    for worker_id in set(memory.scout_roles) - living:
+        del memory.scout_roles[worker_id]
+        changed = True
+    for worker_id in sorted(living):
+        if memory.scout_roles.get(worker_id) not in {"local", "remote"}:
+            memory.scout_roles[worker_id] = "local"
+            changed = True
+
+    target_remote = remote_scout_role_count(len(living))
+    remote = {
+        worker_id
+        for worker_id in living
+        if memory.scout_roles.get(worker_id) == "remote"
+    }
+    while len(remote) < target_remote:
+        sector_counts = Counter(memory.scout_sector_slots[item] for item in remote)
+        candidate = min(
+            living - remote,
+            key=lambda worker_id: (
+                sector_counts[memory.scout_sector_slots[worker_id]],
+                memory.scout_sector_slots[worker_id],
+                worker_id,
+            ),
+        )
+        memory.scout_roles[candidate] = "remote"
+        remote.add(candidate)
+        changed = True
+    while len(remote) > target_remote:
+        sector_counts = Counter(memory.scout_sector_slots[item] for item in remote)
+        candidate = max(
+            remote,
+            key=lambda worker_id: (
+                sector_counts[memory.scout_sector_slots[worker_id]],
+                memory.scout_sector_slots[worker_id],
+                worker_id,
+            ),
+        )
+        memory.scout_roles[candidate] = "local"
+        remote.remove(candidate)
+        changed = True
+    if changed:
+        memory.dirty = True
+
+
+def scout_radius_for_worker(worker_id: str, memory: ScoutMemory) -> int:
+    """Return the fixed radius belonging to one Worker's durable scout role."""
+
+    return (
+        SCOUT_FAR_DISTANCE
+        if memory.scout_roles.get(worker_id) == "remote"
+        else SCOUT_MAX_DISTANCE
+    )
+
+
 def scout_sector(cell: Position, core_position: Position) -> int:
     """Return the cardinal sector containing a cell around the Core.
 
@@ -729,6 +524,7 @@ def scout_coverage_target(
     tick: int,
     blocked: set[Position] | frozenset[Position] = frozenset(),
     max_distance: int = SCOUT_MAX_DISTANCE,
+    min_distance: int = 0,
 ) -> Position | None:
     """Select a stable absolute grid target within the current scout disc."""
 
@@ -737,7 +533,12 @@ def scout_coverage_target(
     existing = memory.scout_targets.get(worker_id)
     if existing is not None and existing not in claimed:
         target = scout_grid_center(existing)
-        if manhattan(core_position, target) > max_distance or target in blocked:
+        core_distance = manhattan(core_position, target)
+        if (
+            core_distance > max_distance
+            or core_distance < min_distance
+            or target in blocked
+        ):
             log.info(
                 "tick=%d worker %s dropping out-of-range scout target=%s",
                 tick,
@@ -779,7 +580,13 @@ def scout_coverage_target(
             memory.dirty = True
 
     center_cell = scout_grid_key(core_position)
-    candidate_cells = scout_grid_disc(core_position, max_distance)
+    candidate_cells = [
+        cell
+        for cell in scout_grid_disc(core_position, max_distance)
+        if manhattan(core_position, scout_grid_center(cell)) >= min_distance
+    ]
+    if not candidate_cells and min_distance:
+        candidate_cells = scout_grid_disc(core_position, max_distance)
 
     candidates: list[tuple[int, int, int, int, int, int, int, tuple[int, int]]] = []
     for gx, gy in candidate_cells:
@@ -1170,8 +977,24 @@ def observe(turn, memory: ScoutMemory) -> Counter:
 
     counts: Counter = Counter()
     flow: Counter = Counter()
+    combat: Counter = Counter()
     for event in turn.events:
         counts[event.event_type] += 1
+        values = event.values if isinstance(event.values, dict) else {}
+        if event.event_type == "SWEEP_RESOLVED":
+            combat["sweeps"] += 1
+            targets_hit = values.get("targets_hit", 0)
+            if isinstance(targets_hit, int) and not isinstance(targets_hit, bool):
+                combat["sweep_targets"] += max(0, targets_hit)
+        elif event.event_type == "SHOT_HIT":
+            combat["ranger_hits"] += 1
+            damage = values.get("damage", 0)
+            if isinstance(damage, int) and not isinstance(damage, bool):
+                combat["ranger_damage"] += max(0, damage)
+        elif event.event_type == "SHOT_MISSED":
+            combat["ranger_misses"] += 1
+        elif event.event_type == "DESTRUCTION_PARTICIPATION":
+            combat["destructions"] += 1
         amount = getattr(event, "resource_amount", None) or 0
         if amount > 0:
             if event.event_type == "HARVEST_SUCCEEDED":
@@ -1223,7 +1046,11 @@ def observe(turn, memory: ScoutMemory) -> Counter:
                     )
         else:
             log.debug("tick=%d event=%s values=%s", turn.tick, event.event_type, event.values)
-        if event.event_type in {"CORE_MOVE_FAILED", "CORE_MOVE_CANCELLED"}:
+        if event.event_type in {
+            "CORE_MOVE_START_FAILED",
+            "CORE_MOVE_FAILED",
+            "CORE_MOVE_CANCELLED",
+        }:
             clear_core_move(memory)
         if event.event_type == "CORE_DAMAGED":
             previous_caution = memory.core_threat_until_tick
@@ -1268,6 +1095,7 @@ def observe(turn, memory: ScoutMemory) -> Counter:
     memory.expire(turn.tick, living_worker_ids)
     memory.last_events = counts
     memory.last_resource_flow = flow
+    memory.last_combat_results = combat
     memory.record_economy(turn.tick, flow)
     return counts
 
@@ -1636,6 +1464,27 @@ def economic_centroid(points: list[Position]) -> Position | None:
     )
 
 
+def core_migration_milestone(
+    origin: Position,
+    destination: Position,
+    limit: int = CORE_DENSITY_MILESTONE_DISTANCE,
+) -> Position:
+    """Return an x-then-y waypoint no more than one chunk from ``origin``."""
+
+    if limit <= 0:
+        return origin
+    remaining = limit
+    x, y = origin
+    dx = destination[0] - x
+    step_x = min(abs(dx), remaining)
+    x += step_x if dx >= 0 else -step_x
+    remaining -= step_x
+    dy = destination[1] - y
+    step_y = min(abs(dy), remaining)
+    y += step_y if dy >= 0 else -step_y
+    return (x, y)
+
+
 def clear_core_migration_goal(memory: ScoutMemory) -> None:
     """Release a completed or obsolete multi-step economic destination."""
 
@@ -1778,6 +1627,16 @@ def start_economic_core_move(
         release_intercept()
         remembered_goal = memory.core_migration_goal
         remembered_kind = memory.core_migration_goal_kind
+        if (
+            remembered_kind == "density"
+            and remembered_goal is not None
+            and manhattan(core.position, remembered_goal)
+            > CORE_DENSITY_MILESTONE_DISTANCE
+        ):
+            # Old persisted state may contain the pre-milestone origin target.
+            # Trim it before it can resume a multi-hour locked march.
+            remembered_goal = core_migration_milestone(core.position, remembered_goal)
+            remember_core_migration_goal(memory, remembered_goal, "density")
         current_quota = chunk_resource_quota(core.position)
         economic_goal = economic_centroid(activity_points)
         remembered_goal_is_valid = (
@@ -1821,7 +1680,7 @@ def start_economic_core_move(
             elif current_quota < CORE_PREFERRED_RESOURCE_QUOTA:
                 # Long-lived economic drift otherwise strands the Core in outer
                 # chunks whose refill quota is only a fraction of the central area.
-                goal = (0, 0)
+                goal = core_migration_milestone(core.position, (0, 0))
                 goal_kind = "density"
                 intents["density_relocating"] += 1
             else:
@@ -2410,115 +2269,6 @@ def beacon_hold_waypoint(
     return core_position
 
 
-def threat_order(
-    unit,
-    enemies: tuple[CoreView | UnitView, ...],
-    carrier: UUID | None,
-    core_position: Position,
-    obstacles: frozenset[Position],
-) -> list:
-    """Rank immediate Core threats before carriers and general targets."""
-
-    immediate_threats = {
-        enemy.id for enemy in core_threatening_enemies(core_position, enemies, obstacles)
-    }
-
-    return sorted(
-        enemies,
-        key=lambda enemy: (
-            enemy.id not in immediate_threats,
-            not (
-                getattr(enemy, "unit_type", None)
-                in {UnitType.VANGUARD, UnitType.RANGER}
-                and manhattan(core_position, enemy.position)
-                <= CORE_DEFENSE_ALERT_DISTANCE
-            ),
-            enemy.id != carrier,
-            getattr(enemy, "unit_type", None) not in {UnitType.VANGUARD, UnitType.RANGER},
-            manhattan(unit.position, enemy.position),
-            str(enemy.id),
-        ),
-    )
-
-
-def target_durability(enemy: CoreView | UnitView) -> int:
-    return enemy.hp + getattr(enemy, "shield", 0)
-
-
-def needs_planned_damage(enemy: CoreView | UnitView, planned_damage: Counter) -> bool:
-    return planned_damage[enemy.id] < target_durability(enemy)
-
-
-def plan_vanguard(
-    vanguard,
-    enemies: tuple[CoreView | UnitView, ...],
-    blocked: set[Position],
-    carrier: UUID | None,
-    reservations: MovementReservations,
-    idle_target: Position,
-    core_position: Position,
-    obstacles: frozenset[Position],
-    planned_damage: Counter,
-) -> None:
-    ordered = threat_order(vanguard, enemies, carrier, core_position, obstacles)
-    if not ordered:
-        move_or_wait(vanguard, idle_target, blocked, reservations)
-        return
-    unfinished = [
-        enemy for enemy in ordered if needs_planned_damage(enemy, planned_damage)
-    ]
-    candidates = unfinished or ordered
-    adjacent = [
-        enemy
-        for enemy in candidates
-        if manhattan(vanguard.position, enemy.position) == 1
-    ]
-    nearest = adjacent[0] if adjacent else candidates[0]
-    dx = nearest.position[0] - vanguard.position[0]
-    dy = nearest.position[1] - vanguard.position[1]
-    if abs(dx) + abs(dy) == 1:
-        vanguard.sweep(direction_between(vanguard.position, nearest.position))
-        for enemy in enemies:
-            if enemy.position == nearest.position:
-                planned_damage[enemy.id] += 1
-        return
-    move_or_wait(vanguard, nearest.position, blocked, reservations)
-
-
-def plan_ranger(
-    ranger,
-    enemies: tuple[CoreView | UnitView, ...],
-    obstacles: frozenset[Position],
-    blocked: set[Position],
-    carrier: UUID | None,
-    reservations: MovementReservations,
-    idle_target: Position,
-    core_position: Position,
-    planned_damage: Counter,
-) -> None:
-    ordered = threat_order(ranger, enemies, carrier, core_position, obstacles)
-    unfinished = [
-        enemy for enemy in ordered if needs_planned_damage(enemy, planned_damage)
-    ]
-    for enemy in unfinished:
-        if is_legal_shot(ranger.position, enemy.position, obstacles):
-            ranger.shoot(enemy)
-            planned_damage[enemy.id] += 1
-            return
-    if unfinished:
-        move_or_wait(ranger, unfinished[0].position, blocked, reservations)
-        return
-    for enemy in ordered:
-        if is_legal_shot(ranger.position, enemy.position, obstacles):
-            ranger.shoot(enemy)
-            planned_damage[enemy.id] += 1
-            return
-    if not ordered:
-        move_or_wait(ranger, idle_target, blocked, reservations)
-        return
-    move_or_wait(ranger, ordered[0].position, blocked, reservations)
-
-
 def max_hp(unit) -> int:
     if unit.unit_type is UnitType.VANGUARD:
         return 4
@@ -2594,9 +2344,9 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
         return
     memory.sync_core_identity(str(turn.core.id))
 
-    # Allocate once per living Worker.  Existing assignments survive target
-    # rotation and restarts; only newly seen Workers take the least-filled slot.
-    ensure_scout_sector_slots({str(worker.id) for worker in turn.workers}, memory)
+    # Allocate once per living Worker. Existing sectors and local/remote roles
+    # survive target rotation and restarts; only a changed fleet is rebalanced.
+    ensure_scout_roles({str(worker.id) for worker in turn.workers}, memory)
 
     enemies = turn.visible_enemies
     enemy_cells = {enemy.position for enemy in enemies}
@@ -2962,6 +2712,9 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
         if enemy.id in immediate_threat_ids
         or manhattan(core_position, enemy.position) <= CORE_DEFENSE_ALERT_DISTANCE
     )
+    carrier_enemies = tuple(
+        enemy for enemy in enemies if enemy.id == hostile_carrier
+    )
     for index, unit in enumerate(combat_units):
         # A Vanguard already adjacent to an enemy must spend this Tick's action
         # on that contact. The old role split assigned the first combat unit to
@@ -2984,10 +2737,24 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
             engagement_targets = defense_enemies
             intents["engaging"] += 1
             idle_target = guard_waypoint(unit, core_position, obstacles)
-        elif enemies and index > 0:
-            engagement_targets = enemies
+        elif carrier_enemies and index < COMBAT_PURSUIT_HUNTERS:
+            engagement_targets = carrier_enemies
             intents["engaging"] += 1
+            intents["carrier_hunting"] += 1
             idle_target = guard_waypoint(unit, core_position, obstacles)
+        elif 0 < index <= COMBAT_PURSUIT_HUNTERS:
+            engagement_targets = tuple(
+                enemy
+                for enemy in enemies
+                if manhattan(unit.position, enemy.position)
+                <= COMBAT_PURSUIT_DISTANCE
+            )
+            if engagement_targets:
+                intents["engaging"] += 1
+                intents["limited_pursuit"] += 1
+            else:
+                intents["scouting"] += 1
+            idle_target = patrol_waypoint(unit, core_position, turn.tick, obstacles)
         elif index == 0:
             engagement_targets = ()
             intents["guarding"] += 1
@@ -3022,12 +2789,11 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
             )
 
     claimed_scout_cells: set[tuple[int, int]] = set()
-    scout_radius = scout_disc_radius(core_position, memory)
-    scout_tether = scout_radius + SCOUT_TETHER_MARGIN
-    if scout_radius > SCOUT_MAX_DISTANCE:
-        intents["searching_wide"] += 1
     for worker in scouts:
         worker_id = str(worker.id)
+        scout_radius = scout_radius_for_worker(worker_id, memory)
+        scout_tether = scout_radius + SCOUT_TETHER_MARGIN
+        scout_role = memory.scout_roles.get(worker_id, "local")
         distance_from_core = manhattan(worker.position, core_position)
         if distance_from_core > scout_tether:
             memory.recalling_workers.add(worker_id)
@@ -3049,6 +2815,9 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
             intents["evading"] += 1
         else:
             intents["scouting"] += 1
+            intents[f"scouting_{scout_role}"] += 1
+            if scout_role == "remote":
+                intents["searching_wide"] += 1
         plan_worker(
             worker,
             turn,
@@ -3070,6 +2839,7 @@ def decide(turn, memory: ScoutMemory | None = None) -> None:
                 turn.tick,
                 worker_travel_blocked,
                 scout_radius,
+                SCOUT_MAX_DISTANCE + 1 if scout_role == "remote" else 0,
             ),
             hard_blocked=worker_hard_blocked,
             retreat=retreating,
@@ -3205,6 +2975,18 @@ def summarize_resource_flow(flow: Counter) -> str:
     return "flow[" + ",".join(f"{name}:{flow[name]}" for name in names) + "]"
 
 
+def summarize_combat(results: Counter) -> str:
+    """Expose resolved attack effectiveness from the previous Tick."""
+
+    return (
+        f"combat[sweeps:{results['sweeps']},"
+        f"targets:{results['sweep_targets']},"
+        f"shots:{results['ranger_hits']}/{results['ranger_misses']},"
+        f"damage:{results['ranger_damage']},"
+        f"destructions:{results['destructions']}]"
+    )
+
+
 def summarize_economy(memory: ScoutMemory, tick: int) -> str:
     """Expose the rolling feedback that controls remote trip length."""
 
@@ -3213,6 +2995,22 @@ def summarize_economy(memory: ScoutMemory, tick: int) -> str:
         f"econ[{ECONOMY_FLOW_WINDOW}:h{totals['harvest']},"
         f"i{totals['income']},loss{totals['lost']},"
         f"n{totals['samples']},trip{memory.last_trip_budget}]"
+    )
+
+
+def summarize_migration(turn, memory: ScoutMemory) -> str:
+    """Expose chunk economics and the currently locked migration milestone."""
+
+    if turn.core is None:
+        return "migration[none]"
+    goal = memory.core_migration_goal
+    distance = manhattan(turn.core.position, goal) if goal is not None else None
+    return (
+        f"migration[ring:{chunk_ring(turn.core.position)},"
+        f"quota:{chunk_resource_quota(turn.core.position)},"
+        f"kind:{memory.core_migration_goal_kind or '-'},"
+        f"goal:{goal if goal is not None else '-'},"
+        f"distance:{distance if distance is not None else '-'}]"
     )
 
 
@@ -3377,7 +3175,7 @@ def main() -> None:
             memory.save(turn.tick)
             deposit_eta = nearest_deposit_eta(turn, memory.known_obstacles)
             log.info(
-                "tick=%d status=%s resources=%d/%d pop=%d %s %s %s %s %s %s map[r:%d,o:%d] "
+                "tick=%d status=%s resources=%d/%d pop=%d %s %s %s %s %s %s %s %s map[r:%d,o:%d] "
                 "deposit_eta=%s hold=%s plan_ms=%.1f %s %s",
                 turn.tick,
                 turn.state.status.value,
@@ -3387,8 +3185,10 @@ def main() -> None:
                 summarize_fleet(turn),
                 summarize_intents(memory.last_intents),
                 summarize_resource_flow(memory.last_resource_flow),
+                summarize_combat(memory.last_combat_results),
                 summarize_economy(memory, turn.tick),
                 summarize_core_state(turn, memory.known_obstacles),
+                summarize_migration(turn, memory),
                 memory.last_defense_status or "defense[-]",
                 len(memory.known_resources),
                 len(memory.known_obstacles),
